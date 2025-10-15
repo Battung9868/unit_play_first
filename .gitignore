@@ -1,24 +1,28 @@
 # Xcode
-build/
+*.xcuserdatad/
+xcuserdata/
+*.mode1v3
+*.mode2v3
+*.perspectivev3
 DerivedData/
-*.xcuserdatad
-*.xcscmblueprint
-*.xccheckout
-
-# iOS artifacts
+build/
 *.ipa
-*.dSYM*
 *.xcarchive
+*.dSYM
+*.dSYM.zip
+
+# macOS
+.DS_Store
 
 # CocoaPods
 Pods/
-Podfile.lock
+!Podfile
+!Podfile.lock
 
-# Signing (секреты не коммитим)
-*.p12
-*.mobileprovision
-*.p8
+# SwiftPM / Carthage (если не нужны — оставьте)
+.build/
+Carthage/Build/
 
 # Misc
-.DS_Store
-.idea/
+*.tmp
+*.swp
