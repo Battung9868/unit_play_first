@@ -5,21 +5,14 @@ workflows:
 
     environment:
       groups:
-        - signing
-        - appstore_connect
+        - signing            # CERTIFICATE_P12, CERTIFICATE_PASSWORD, MOBILEPROVISION
+        - appstore_connect   # APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY
       vars:
-        # ← Обновил под твой новый бандл
-        BUNDLE_ID: "io.battung.brightbins"
-
-        # Эти два можно оставить пустыми — автоопределим ниже.
-        XCODE_PROJECT: ""
-        XCODE_SCHEME: ""   # если пусто, найдём первый общий (Shared) схему
-
-        EXPORT_METHOD: "app-store"
-        TEAM_ID: "OVERRIDE_BY_PROFILE"
+        BUNDLE_ID: "io.battung.brightbins"   # твой бандл
+        EXPORT_METHOD: "app-store"           # способ экспорта (testflight/app-store)
 
     scripts:
-      - name: "Git LFS"
+      - name: "Git LFS (обязательно для Unity-бинарников)"
         script: |
           set -euo pipefail
           git lfs install
@@ -29,24 +22,31 @@ workflows:
       - name: "Import certificate and provisioning profile"
         script: |
           set -euo pipefail
+
           echo "$CERTIFICATE_P12" | base64 --decode > cert.p12
           echo "$MOBILEPROVISION" | base64 --decode > profile.mobileprovision
+
+          # Кейчейн и сертификат
           keychain initialize
           if [ -n "${CERTIFICATE_PASSWORD:-}" ]; then
             keychain add-certificates --certificate cert.p12 --certificate-password "$CERTIFICATE_PASSWORD"
           else
             keychain add-certificates --certificate cert.p12
           fi
+
+          # Установка профиля и извлечение UUID/TeamID
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
           PROFILE_PLIST="$(security cms -D -i profile.mobileprovision)"
           PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print UUID' /dev/stdin <<< "$PROFILE_PLIST")
-          PROFILE_TEAM_ID=$(/usr/libexec/PlistBuddy -c 'Print TeamIdentifier:0' /dev/stdin <<< "$PROFILE_PLIST")
+          TEAM_ID=$(/usr/libexec/PlistBuddy -c 'Print TeamIdentifier:0' /dev/stdin <<< "$PROFILE_PLIST")
           cp profile.mobileprovision "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+
           {
             echo "PROFILE_UUID=$PROFILE_UUID"
-            echo "TEAM_ID=$PROFILE_TEAM_ID"
+            echo "TEAM_ID=$TEAM_ID"
           } >> "$CM_ENV"
 
+          # exportOptions.plist
           cat > exportOptions.plist <<EOI
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -64,55 +64,56 @@ workflows:
           EOI
           /usr/bin/plutil -lint exportOptions.plist
 
-      - name: "Locate Xcode project/workspace & optional CocoaPods"
+      - name: "Locate Xcode project/workspace & install CocoaPods if needed"
         script: |
           set -euo pipefail
 
-          # 1) Найдём папку, где лежит *.xcworkspace или *.xcodeproj
-          ROOT="$(pwd)"
-          TARGET_DIR=""
-          # приоритет workspace (после pod install)
-          if TARGET_DIR=$(dirname "$(find . -type f -name "*.xcworkspace" -print -quit)"); then true; fi
+          # Ищем сначала .xcworkspace, если нет — .xcodeproj (глубина любая)
+          TARGET_DIR="$(dirname "$(find . -type f -name "*.xcworkspace" -print -quit)")"
           if [ -z "$TARGET_DIR" ] || [ "$TARGET_DIR" = "." ]; then
-            TARGET_DIR=$(dirname "$(find . -type f -name "*.xcodeproj" -print -quit)")
+            TARGET_DIR="$(dirname "$(find . -type f -name "*.xcodeproj" -print -quit)")"
           fi
           if [ -z "$TARGET_DIR" ]; then
-            echo "❌ No .xcworkspace or .xcodeproj found in repo." >&2
+            echo "No .xcworkspace or .xcodeproj found." >&2
             exit 66
           fi
-          echo "➡️  Using project directory: $TARGET_DIR"
+          echo "Project directory: $TARGET_DIR"
           cd "$TARGET_DIR"
 
-          # 2) Если есть Podfile — ставим Pods (создаст workspace)
+          # CocoaPods (если есть Podfile)
           if [ -f "Podfile" ]; then
             gem install cocoapods --no-document
             pod repo update
             pod install
           fi
 
-          # 3) Определим workspace/project и схему
+          # Определим workspace/project
           if ls ./*.xcworkspace >/dev/null 2>&1; then
-            echo "Detected workspace:"
-            XCODE_WORKSPACE="$(ls -1 *.xcworkspace | head -n1)"
+            XCODE_WORKSPACE="$(ls -1 *.xcworkspace | head -n 1)"
             echo "XCODE_WORKSPACE=$XCODE_WORKSPACE" >> "$CM_ENV"
           else
-            XCODE_PROJECT_FILE="$(ls -1 *.xcodeproj | head -n1)"
-            echo "XCODE_PROJECT=$XCODE_PROJECT_FILE" >> "$CM_ENV"
+            XCODE_PROJECT="$(ls -1 *.xcodeproj | head -n 1)"
+            echo "XCODE_PROJECT=$XCODE_PROJECT" >> "$CM_ENV"
           fi
 
-          # Если схема не указана — возьмём первую общую (Shared)
-          if [ -z "${XCODE_SCHEME:-}" ]; then
-            if [ -n "${XCODE_WORKSPACE:-}" ]; then
-              SCHEMES=$(xcodebuild -workspace "$XCODE_WORKSPACE" -list -json | jq -r '.workspace.schemes[]')
-            else
-              SCHEMES=$(xcodebuild -project "$XCODE_PROJECT_FILE" -list -json | jq -r '.project.schemes[]')
-            fi
-            FIRST_SCHEME=$(echo "$SCHEMES" | head -n1)
-            echo "Автовыбрана схема: $FIRST_SCHEME"
-            echo "XCODE_SCHEME=$FIRST_SCHEME" >> "$CM_ENV"
+          # Автовыбор Shared-схемы
+          if [ -n "${XCODE_WORKSPACE:-}" ]; then
+            SCHEMES_JSON="$(xcodebuild -workspace "$XCODE_WORKSPACE" -list -json 2>/dev/null || true)"
           else
-            echo "XCODE_SCHEME=$XCODE_SCHEME" >> "$CM_ENV"
+            SCHEMES_JSON="$(xcodebuild -project "$XCODE_PROJECT" -list -json 2>/dev/null || true)"
           fi
+          XCODE_SCHEME="$(/usr/bin/python3 - <<'PY'
+import json,sys
+data=json.loads(sys.stdin.read() or "{}")
+sch = (data.get("workspace",{}) or data.get("project",{})).get("schemes",[])
+print(sch[0] if sch else "")
+PY
+          <<< "$SCHEMES_JSON")"
+          if [ -z "$XCODE_SCHEME" ]; then
+            echo "No shared schemes found. Please share a scheme in Xcode." >&2
+            exit 66
+          fi
+          echo "XCODE_SCHEME=$XCODE_SCHEME" >> "$CM_ENV"
 
       - name: "Prepare versions"
         script: |
@@ -122,6 +123,7 @@ workflows:
           if [ -n "${APP_VERSION:-}" ]; then
             echo "APP_VERSION=$APP_VERSION" >> "$CM_ENV"
           fi
+          echo "Planned: CURRENT_PROJECT_VERSION=$BUILD_NUM MARKETING_VERSION=${APP_VERSION:-unchanged}"
 
       - name: "Archive and export IPA"
         script: |
@@ -135,7 +137,7 @@ workflows:
           fi
 
           if [ -n "${XCODE_WORKSPACE:-}" ]; then
-            echo "🔧 Building workspace: $XCODE_WORKSPACE (scheme: $XCODE_SCHEME)"
+            echo "Building workspace: $XCODE_WORKSPACE (scheme: $XCODE_SCHEME)"
             xcodebuild \
               -workspace "$XCODE_WORKSPACE" \
               -scheme "$XCODE_SCHEME" \
@@ -150,7 +152,7 @@ workflows:
               COMPILER_INDEX_STORE_ENABLE=NO \
               "${EXTRA_FLAGS[@]}" | xcpretty
           else
-            echo "🔧 Building project: $XCODE_PROJECT (scheme: $XCODE_SCHEME)"
+            echo "Building project: $XCODE_PROJECT (scheme: $XCODE_SCHEME)"
             xcodebuild \
               -project "$XCODE_PROJECT" \
               -scheme "$XCODE_SCHEME" \
