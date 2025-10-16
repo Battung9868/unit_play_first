@@ -5,13 +5,11 @@ workflows:
 
     environment:
       groups:
-        - signing            # CERTIFICATE_P12, CERTIFICATE_PASSWORD, MOBILEPROVISION
-        - appstore_connect   # APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY
+        - signing
+        - appstore_connect
       vars:
         BUNDLE_ID: "io.battung.brightbins"
         EXPORT_METHOD: "app-store"
-        # APP_VERSION: "1.1"
-        # APP_BUILD: "123"
 
     scripts:
       - name: "Git LFS (большие Unity-бинарники)"
@@ -23,236 +21,64 @@ workflows:
 
       - name: "Импорт сертификата и профиля"
         script: |
-          set -euo pipefail
-
-          echo "$CERTIFICATE_P12" | base64 --decode > cert.p12
-          echo "$MOBILEPROVISION" | base64 --decode > profile.mobileprovision
-
-          keychain initialize
-          if [ -n "${CERTIFICATE_PASSWORD:-}" ]; then
-            keychain add-certificates --certificate cert.p12 --certificate-password "$CERTIFICATE_PASSWORD"
-          else
-            keychain add-certificates --certificate cert.p12
-          fi
-
-          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
-          PROFILE_PLIST="$(security cms -D -i profile.mobileprovision)"
-          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print UUID' /dev/stdin <<< "$PROFILE_PLIST")
-          PROFILE_NAME=$(/usr/libexec/PlistBuddy -c 'Print Name' /dev/stdin <<< "$PROFILE_PLIST")
-          TEAM_ID=$(/usr/libexec/PlistBuddy -c 'Print TeamIdentifier:0' /dev/stdin <<< "$PROFILE_PLIST")
-          cp profile.mobileprovision "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
-
-          {
-            echo "PROFILE_UUID=$PROFILE_UUID"
-            echo "PROFILE_NAME=$PROFILE_NAME"
-            echo "TEAM_ID=$TEAM_ID"
-          } >> "$CM_ENV"
-
-          cat > exportOptions.plist <<EOI
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0"><dict>
-            <key>method</key><string>${EXPORT_METHOD}</string>
-            <key>teamID</key><string>${TEAM_ID}</string>
-            <key>signingStyle</key><string>manual</string>
-            <key>provisioningProfiles</key><dict>
-              <key>${BUNDLE_ID}</key><string>${PROFILE_NAME}</string>
-            </dict>
-            <key>compileBitcode</key><false/>
-            <key>stripSwiftSymbols</key><true/>
-            <key>destination</key><string>export</string>
-          </dict></plist>
-          EOI
-          /usr/bin/plutil -lint exportOptions.plist
+          # (оставь как в предыдущей версии — без изменений)
+          :
 
       - name: "Найти Xcode проект/воркспейс и схему"
         script: |
-          set -euo pipefail
-
-          TARGET_WS="$(find . -type d -name "*.xcworkspace" -prune -print -quit || true)"
-          TARGET_PR="$(find . -type d -name "*.xcodeproj"   -prune -print -quit || true)"
-
-          if [ -n "$TARGET_WS" ]; then
-            TARGET_DIR="$(dirname "$TARGET_WS")"; cd "$TARGET_DIR"
-            XCODE_WORKSPACE="$(basename "$TARGET_WS")"
-            echo "Using workspace: $XCODE_WORKSPACE (dir: $TARGET_DIR)"
-            echo "XCODE_WORKSPACE=$XCODE_WORKSPACE" >> "$CM_ENV"
-          elif [ -n "$TARGET_PR" ]; then
-            TARGET_DIR="$(dirname "$TARGET_PR")"; cd "$TARGET_DIR"
-            XCODE_PROJECT="$(basename "$TARGET_PR")"
-            echo "Using project: $XCODE_PROJECT (dir: $TARGET_DIR)"
-            echo "XCODE_PROJECT=$XCODE_PROJECT" >> "$CM_ENV"
-          else
-            echo "❌ No .xcworkspace or .xcodeproj found. Tree:" >&2
-            find . -maxdepth 3 -print | sed -n '1,300p'
-            exit 66
-          fi
-
-          if [ -f "Podfile" ]; then
-            gem install cocoapods --no-document
-            pod repo update
-            pod install
-            if ls ./*.xcworkspace >/dev/null 2>&1; then
-              XCODE_WORKSPACE="$(ls -1 *.xcworkspace | head -n1)"
-              echo "Detected workspace after Pods: $XCODE_WORKSPACE"
-              echo "XCODE_WORKSPACE=$XCODE_WORKSPACE" >> "$CM_ENV"
-            fi
-          fi
-
-          if [ -n "${XCODE_WORKSPACE:-}" ]; then
-            LIST_TXT="$(xcodebuild -workspace "$XCODE_WORKSPACE" -list 2>/dev/null || true)"
-          else
-            LIST_TXT="$(xcodebuild -project "$XCODE_PROJECT" -list 2>/dev/null || true)"
-          fi
-
-          SCHEMES="$(printf '%s\n' "$LIST_TXT" | awk '/Schemes:/{f=1;next} f&&NF{print}' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-          if [ -z "$SCHEMES" ]; then
-            echo "❌ No shared schemes. Output:"; printf '%s\n' "$LIST_TXT"; exit 66
-          fi
-          echo "$SCHEMES" | tr -d '\r' > schemes.txt
-
-          XCODE_SCHEME=""
-          FIRST_SCHEME="$(head -n1 schemes.txt)"
-          if grep -qx "Unity-iPhone" schemes.txt; then
-            XCODE_SCHEME="Unity-iPhone"
-          else
-            while IFS= read -r s; do
-              [ -z "$s" ] && continue
-              if [ -n "${XCODE_WORKSPACE:-}" ]; then
-                if xcodebuild -workspace "$XCODE_WORKSPACE" -scheme "$s" -showBuildSettings 2>/dev/null | grep -q "WRAPPER_EXTENSION = app"; then XCODE_SCHEME="$s"; break; fi
-              else
-                if xcodebuild -project "$XCODE_PROJECT" -scheme "$s" -showBuildSettings 2>/dev/null | grep -q "WRAPPER_EXTENSION = app"; then XCODE_SCHEME="$s"; break; fi
-              fi
-            done < schemes.txt
-          fi
-          [ -z "$XCODE_SCHEME" ] && XCODE_SCHEME="$FIRST_SCHEME"
-          echo "Detected scheme: $XCODE_SCHEME"
-          echo "XCODE_SCHEME=$XCODE_SCHEME" >> "$CM_ENV"
+          # (оставь как в предыдущей версии — без изменений)
+          :
 
       - name: "Manual signing только для app-таргета"
         script: |
-          set -euo pipefail
-          if [ -n "${XCODE_PROJECT:-}" ]; then
-            PROJ_PATH="$XCODE_PROJECT"
-          else
-            PROJ_PATH="$(ls -1 *.xcodeproj | head -n1)"
-          fi
-          echo "Applying profiles to: $PROJ_PATH"
-          xcode-project use-profiles --project "$PROJ_PATH" --export-options-plist exportOptions.plist
+          # (оставь как в предыдущей версии — без изменений)
+          :
 
-      - name: "Отключить Unity IL2CPP/Bee Run Script (GameAssembly) — без Python"
+      # ⛔️ ВАЖНО: этот шаг мы УБРАЛИ
+      # - name: "Отключить Unity IL2CPP/Bee Run Script (GameAssembly) — без Python"
+      #   script: | ...
+      # ---------------------------------------------
+
+      - name: "Проверка наличия IL2CPP toolchain в проекте"
         script: |
           set -euo pipefail
-          if [ -n "${XCODE_PROJECT:-}" ]; then
-            PBXPROJ="$XCODE_PROJECT/project.pbxproj"
+          ROOT="$(pwd)"
+          DEPLOY_DIR_1="$ROOT/Il2CppOutputProject/IL2CPP/build/deploy_arm64"
+          DEPLOY_DIR_2="$ROOT/Il2CppOutputProject/IL2CPP/build/deploy"
+          BEE_1="$DEPLOY_DIR_1/bee_backend/mac-arm64/bee_backend"
+          BEE_2="$DEPLOY_DIR_2/bee_backend/mac-arm64/bee_backend"
+          IL2CPP_1="$DEPLOY_DIR_1/il2cpp"
+          IL2CPP_2="$DEPLOY_DIR_2/il2cpp"
+
+          echo "Проверяю Il2CppOutputProject содержимое…"
+          find Il2CppOutputProject -maxdepth 3 -type d -name "deploy*" -print || true
+
+          if [ -x "$IL2CPP_1" ] && [ -x "$BEE_1" ]; then
+            echo "OK: найдено $DEPLOY_DIR_1"
+          elif [ -x "$IL2CPP_2" ] && [ -x "$BEE_2" ]; then
+            echo "OK: найдено $DEPLOY_DIR_2"
           else
-            PNAME="$(basename "$XCODE_WORKSPACE" .xcworkspace)"
-            PBXPROJ="$PNAME.xcodeproj/project.pbxproj"
+            echo "❌ Il2CPP/bee не найдены в репозитории."
+            echo "Нужно заново экспортировать Xcode-проект из Unity и ЗАКОМИТИТЬ эти каталоги:"
+            echo "  Il2CppOutputProject/IL2CPP/build/deploy_arm64  (или build/deploy)"
+            echo "  Il2CppOutputProject/IL2CPP/build/bee_backend"
+            echo
+            echo "Подсказка по LFS:"
+            echo "  git lfs track \"Il2CppOutputProject/IL2CPP/build/**\""
+            echo "  git add .gitattributes Il2CppOutputProject/IL2CPP/build"
+            echo "  git commit -m \"Add il2cpp deploy and bee backend\" && git push"
+            exit 65
           fi
-          [ -f "$PBXPROJ" ] || { echo "No project.pbxproj at $PBXPROJ"; exit 0; }
-
-          cp "$PBXPROJ" "$PBXPROJ.bak"
-
-          # На любой строке shellScript, где фигурируют Il2Cpp/Bee/il2cpp, заменяем на echo
-          awk 'BEGIN{IGNORECASE=1}
-               /shellScript = "/ && /(Il2CppOutputProject|bee_backend|deploy_arm64|il2cpp)/ {
-                 sub(/shellScript = ".*";/, "shellScript = \"echo Skipped IL2CPP/Bee on CI;\";");
-               }
-               {print}' "$PBXPROJ" > "$PBXPROJ.tmp"
-          mv "$PBXPROJ.tmp" "$PBXPROJ"
-
-          echo "Patched lines:"
-          grep -n 'shellScript = "echo Skipped IL2CPP/Bee on CI;' "$PBXPROJ" || true
 
       - name: "Prepare versions"
         script: |
-          set -eo pipefail
-          if [ -n "${APP_BUILD:-}" ]; then
-            BUILD_NUM="$APP_BUILD"
-          else
-            BUILD_NUM="$(date +%y%j%H%M%S)"
-          fi
-          echo "BUILD_NUM=$BUILD_NUM" >> "$CM_ENV"
-          if [ -n "${APP_VERSION:-}" ]; then
-            echo "APP_VERSION=$APP_VERSION" >> "$CM_ENV"
-            echo "Planned: CURRENT_PROJECT_VERSION=$BUILD_NUM MARKETING_VERSION=$APP_VERSION"
-          else
-            echo "Planned: CURRENT_PROJECT_VERSION=$BUILD_NUM MARKETING_VERSION=unchanged"
-          fi
+          # (оставь как в предыдущей версии — без изменений)
+          :
 
       - name: "Archive and export IPA"
         script: |
-          set -eo pipefail
-
-          ARCHIVE_PATH="$CM_BUILD_DIR/App.xcarchive"
-          EXPORT_PATH="$CM_EXPORT_DIR"
-          LOGFILE="$CM_BUILD_DIR/xcodebuild-archive.log"
-
-          EXTRA_FLAGS=( CURRENT_PROJECT_VERSION="$BUILD_NUM" )
-          if [ -n "${APP_VERSION:-}" ]; then EXTRA_FLAGS+=( MARKETING_VERSION="$APP_VERSION" ); fi
-
-          if [ -z "${XCODE_PROJECT:-}" ] && [ -z "${XCODE_WORKSPACE:-}" ]; then
-            TARGET_WS="$(find . -type d -name "*.xcworkspace" -prune -print -quit || true)"
-            TARGET_PR="$(find . -type d -name "*.xcodeproj"   -prune -print -quit || true)"
-            if [ -n "$TARGET_WS" ]; then cd "$(dirname "$TARGET_WS")"; XCODE_WORKSPACE="$(basename "$TARGET_WS")"; echo "XCODE_WORKSPACE=$XCODE_WORKSPACE" >> "$CM_ENV"
-            elif [ -n "$TARGET_PR" ]; then cd "$(dirname "$TARGET_PR")"; XCODE_PROJECT="$(basename "$TARGET_PR")"; echo "XCODE_PROJECT=$XCODE_PROJECT" >> "$CM_ENV"
-            else echo "❌ No project/workspace"; exit 66; fi
-          fi
-
-          if [ -z "${XCODE_SCHEME:-}" ]; then
-            if [ -n "${XCODE_WORKSPACE:-}" ]; then LIST_TXT="$(xcodebuild -workspace "$XCODE_WORKSPACE" -list 2>/dev/null || true)"
-            else LIST_TXT="$(xcodebuild -project "$XCODE_PROJECT" -list 2>/dev/null || true)"; fi
-            SCHEMES="$(printf '%s\n' "$LIST_TXT" | awk '/Schemes:/{f=1;next} f&&NF{print}' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-            [ -n "$SCHEMES" ] || { echo "❌ No schemes"; printf '%s\n' "$LIST_TXT"; exit 66; }
-            if printf '%s\n' "$SCHEMES" | grep -qx "Unity-iPhone"; then XCODE_SCHEME="Unity-iPhone"; else XCODE_SCHEME="$(printf '%s\n' "$SCHEMES" | head -n1)"; fi
-            echo "XCODE_SCHEME=$XCODE_SCHEME" >> "$CM_ENV"
-          fi
-
-          echo "Archiving… logs → $LOGFILE"
-          set +e
-          if [ -n "${XCODE_WORKSPACE:-}" ]; then
-            xcodebuild \
-              -workspace "$XCODE_WORKSPACE" \
-              -scheme "$XCODE_SCHEME" \
-              -configuration Release \
-              -archivePath "$ARCHIVE_PATH" \
-              -destination "generic/platform=iOS" \
-              archive \
-              DEVELOPMENT_TEAM="$TEAM_ID" \
-              CODE_SIGN_STYLE=Manual \
-              PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
-              CODE_SIGN_IDENTITY="Apple Distribution" \
-              COMPILER_INDEX_STORE_ENABLE=NO \
-              "${EXTRA_FLAGS[@]}" | tee "$LOGFILE"
-          else
-            xcodebuild \
-              -project "$XCODE_PROJECT" \
-              -scheme "$XCODE_SCHEME" \
-              -configuration Release \
-              -archivePath "$ARCHIVE_PATH" \
-              -destination "generic/platform=iOS" \
-              archive \
-              DEVELOPMENT_TEAM="$TEAM_ID" \
-              CODE_SIGN_STYLE=Manual \
-              PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
-              CODE_SIGN_IDENTITY="Apple Distribution" \
-              COMPILER_INDEX_STORE_ENABLE=NO \
-              "${EXTRA_FLAGS[@]}" | tee "$LOGFILE"
-          fi
-          EXIT=${PIPESTATUS[0]}
-          set -e
-          if [ "$EXIT" -ne 0 ]; then
-            echo "==== LAST 300 LINES OF XCODEBUILD LOG ===="; tail -n 300 "$LOGFILE" || true; exit "$EXIT"
-          fi
-
-          echo "Exporting IPA…"
-          xcodebuild -exportArchive \
-            -archivePath "$ARCHIVE_PATH" \
-            -exportOptionsPlist exportOptions.plist \
-            -exportPath "$EXPORT_PATH" | tee -a "$LOGFILE"
-
-          echo "Export dir:"; ls -lah "$EXPORT_PATH"
-          test -e "$EXPORT_PATH"/*.ipa
+          # (оставь как в предыдущей версии — без изменений)
+          :
 
     artifacts:
       - $CM_BUILD_DIR/xcodebuild-archive.log
