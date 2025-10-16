@@ -15,7 +15,7 @@ workflows:
         CHOSEN_SCHEME: Unity-iPhone
         PROFILE_NAME: BrightBins              # имя профиля (НЕ UUID)
         EXPORT_METHOD: app-store              # корректное значение для App Store
-        # Если проект не в корне — укажи путь явно (одну из строк ниже):
+        # Если проект не в корне — укажи путь явно (одну из строк ниже) и Unity-экспорт не понадобится:
         # XCODE_PROJECT: "Build/iOS/Unity-iPhone.xcodeproj"
         # XCODE_WORKSPACE: "MyApp.xcworkspace"
 
@@ -87,6 +87,88 @@ workflows:
             *) echo "⚠️ Похоже, профиль не для $BUNDLE_ID. Проверь тип (App Store) и bundle id." ;;
           esac
 
+      - name: Если Xcode-проекта нет — экспортировать его из Unity (headless)
+        script: |
+          set -eu
+
+          # Если явно задан workspace/project — ничего не делаем
+          if [ -n "${XCODE_WORKSPACE:-}" ] || [ -n "${XCODE_PROJECT:-}" ]; then
+            echo "➡️ XCODE_WORKSPACE/PROJECT уже заданы, Unity-экспорт не требуется."
+            exit 0
+          fi
+
+          ROOT="${CM_REPO_DIR:-$PWD}"
+          echo "📁 Repo root: $ROOT"
+
+          # Уже есть .xcworkspace/.xcodeproj в репо?
+          XW="$(find "$ROOT" -maxdepth 8 -type d -name "*.xcworkspace" -print -quit 2>/dev/null || true)"
+          XP="$(find "$ROOT" -maxdepth 8 -type d -name "*.xcodeproj"   -print -quit 2>/dev/null || true)"
+          if [ -n "$XW" ] || [ -n "$XP" ]; then
+            echo "✅ Xcode-проект уже найден в репо, пропускаю Unity-экспорт."
+            exit 0
+          fi
+
+          echo "🧩 Xcode-проект не найден. Запускаю Unity в headless, чтобы экспортировать iOS-проект…"
+
+          # Минимальный Editor-скрипт для сборки iOS
+          mkdir -p "$ROOT/Assets/Editor"
+          cat > "$ROOT/Assets/Editor/CIBuilder.cs" <<'CS'
+          using System.Linq;
+          using System.IO;
+          using UnityEditor;
+          using UnityEditor.Build.Reporting;
+          using UnityEngine;
+
+          public static class CIBuilder {
+              public static void PerformIOSBuild() {
+                  var scenes = EditorBuildSettings.scenes
+                      .Where(s => s.enabled)
+                      .Select(s => s.path)
+                      .ToArray();
+
+                  if (scenes.Length == 0) {
+                      throw new System.Exception("No enabled scenes in Build Settings.");
+                  }
+
+                  var buildPath = Path.Combine("Build", "iOS");
+                  Directory.CreateDirectory(buildPath);
+
+                  var report = BuildPipeline.BuildPlayer(scenes, buildPath, BuildTarget.iOS, BuildOptions.None);
+                  if (report.summary.result != BuildResult.Succeeded) {
+                      throw new System.Exception("iOS build failed: " + report.summary.result);
+                  }
+                  Debug.Log("✅ Unity exported iOS project to: " + buildPath);
+              }
+          }
+          CS
+
+          # Ищем Unity бинарник
+          UNITY_BIN="$(ls -d /Applications/Unity/Hub/Editor/*/Unity.app/Contents/MacOS/Unity 2>/dev/null | sort -V | tail -n 1 || true)"
+          if [ -z "$UNITY_BIN" ]; then
+            # запасной путь
+            UNITY_BIN="/Applications/Unity/Unity.app/Contents/MacOS/Unity"
+          fi
+          if [ ! -x "$UNITY_BIN" ]; then
+            echo "❌ Unity не найден. Укажи XCODE_PROJECT вручную или установи Unity на образе."
+            exit 1
+          fi
+          echo "🟢 Использую Unity: $UNITY_BIN"
+
+          "$UNITY_BIN" -quit -batchmode -nographics \
+            -projectPath "$ROOT" \
+            -executeMethod CIBuilder.PerformIOSBuild \
+            -logFile "$CM_BUILD_DIR/unity-export.log"
+
+          # Проверяем, что Xcode-проект появился
+          XP2="$(find "$ROOT/Build/iOS" -maxdepth 1 -type d -name "*.xcodeproj" -print -quit 2>/dev/null || true)"
+          if [ -z "$XP2" ]; then
+            echo "❌ Unity не создал .xcodeproj в Build/iOS. Смотри лог: $CM_BUILD_DIR/unity-export.log"
+            exit 1
+          fi
+
+          echo "✅ Найден Xcode-проект: $XP2"
+          echo "export XCODE_PROJECT=\"$XP2\"" >> "$CM_ENV"
+
       - name: Найти проект/воркспейс и схему (POSIX-поиск)
         script: |
           set -eu
@@ -95,14 +177,14 @@ workflows:
           echo "✅ Using scheme (forced): $CHOSEN"
           echo "export CHOSEN_SCHEME=\"$CHOSEN\"" >> "$CM_ENV"
 
-          # Если путь задан вручную — используем его
+          # Если путь задан вручную/получен из Unity — уважаем его
           if [ -n "${XCODE_WORKSPACE:-}" ] && [ -d "$XCODE_WORKSPACE" ]; then
-            echo "Using workspace (from vars): $XCODE_WORKSPACE"
+            echo "Using workspace (predefined): $XCODE_WORKSPACE"
             echo "export XCODE_WORKSPACE=\"$XCODE_WORKSPACE\"" >> "$CM_ENV"
             exit 0
           fi
           if [ -n "${XCODE_PROJECT:-}" ] && [ -d "$XCODE_PROJECT" ]; then
-            echo "Using project (from vars): $XCODE_PROJECT"
+            echo "Using project (predefined): $XCODE_PROJECT"
             echo "export XCODE_PROJECT=\"$XCODE_PROJECT\"" >> "$CM_ENV"
             exit 0
           fi
@@ -112,10 +194,7 @@ workflows:
           echo "🔎 Поиск *.xcworkspace / *.xcodeproj (до 8 уровней)…"
 
           XW="$(find "$ROOT" -maxdepth 8 -type d -name "*.xcworkspace" -print -quit 2>/dev/null || true)"
-          XP=""
-          if [ -z "$XW" ]; then
-            XP="$(find "$ROOT" -maxdepth 8 -type d -name "*.xcodeproj" -print -quit 2>/dev/null || true)"
-          fi
+          XP="$(find "$ROOT" -maxdepth 8 -type d -name "*.xcodeproj"   -print -quit 2>/dev/null || true)"
 
           if [ -n "$XW" ]; then
             echo "✅ Workspace найден: $XW"
@@ -227,6 +306,7 @@ workflows:
           | tee "$CM_BUILD_DIR/xcodebuild-export.log"
 
     artifacts:
+      - $CM_BUILD_DIR/unity-export.log
       - $CM_BUILD_DIR/xcodebuild-archive.log
       - $CM_BUILD_DIR/xcodebuild-export.log
       - $CM_EXPORT_DIR/*.ipa
