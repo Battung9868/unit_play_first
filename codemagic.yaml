@@ -106,48 +106,18 @@ workflows:
             fi
           fi
 
-          # 3) Получаем список схем (текстовый вывод)
-          if [ -n "${XCODE_WORKSPACE:-}" ]; then
-            LIST_TXT="$(xcodebuild -workspace "$XCODE_WORKSPACE" -list 2>/dev/null || true)"
+      - name: "Apply manual signing (app target only)"
+        script: |
+          set -euo pipefail
+          # Определим путь к .xcodeproj для xcode-project use-profiles
+          if [ -n "${XCODE_PROJECT:-}" ]; then
+            PROJ_PATH="$XCODE_PROJECT"
           else
-            LIST_TXT="$(xcodebuild -project "$XCODE_PROJECT" -list 2>/dev/null || true)"
+            PROJ_PATH="$(ls -1 *.xcodeproj | head -n1)"
           fi
-
-          SCHEMES="$(printf '%s\n' "$LIST_TXT" | awk '/Schemes:/{flag=1;next} flag && NF {print}' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-          if [ -z "$SCHEMES" ]; then
-            echo "❌ No shared schemes found. Enable 'Shared' in Xcode." >&2
-            printf 'xcodebuild -list output:\n%s\n' "$LIST_TXT" >&2
-            exit 66
-          fi
-
-          # Сохраним список схем в файл (без heredoc/подстановок)
-          echo "$SCHEMES" | tr -d '\r' > schemes.txt
-
-          # 4) Выбираем схему: Unity-iPhone > любая с WRAPPER_EXTENSION=app > первая
-          XCODE_SCHEME=""
-          FIRST_SCHEME="$(head -n 1 schemes.txt)"
-
-          if grep -qx "Unity-iPhone" schemes.txt; then
-            XCODE_SCHEME="Unity-iPhone"
-          else
-            while IFS= read -r s; do
-              [ -z "$s" ] && continue
-              if [ -n "${XCODE_WORKSPACE:-}" ]; then
-                if xcodebuild -workspace "$XCODE_WORKSPACE" -scheme "$s" -showBuildSettings 2>/dev/null | grep -q "WRAPPER_EXTENSION = app"; then
-                  XCODE_SCHEME="$s"; break
-                fi
-              else
-                if xcodebuild -project "$XCODE_PROJECT" -scheme "$s" -showBuildSettings 2>/dev/null | grep -q "WRAPPER_EXTENSION = app"; then
-                  XCODE_SCHEME="$s"; break
-                fi
-              fi
-            done < schemes.txt
-          fi
-
-          [ -z "$XCODE_SCHEME" ] && XCODE_SCHEME="$FIRST_SCHEME"
-
-          echo "Detected scheme: $XCODE_SCHEME"
-          echo "XCODE_SCHEME=$XCODE_SCHEME" >> "$CM_ENV"
+          echo "Applying profiles to project: $PROJ_PATH"
+          # Пропишет provisioning только для таргета с ${BUNDLE_ID}, остальным не тронет
+          xcode-project use-profiles --project "$PROJ_PATH" --export-options-plist exportOptions.plist
 
       - name: "Patch Unity 'Run Script' phases that break CI"
         script: |
@@ -178,10 +148,8 @@ workflows:
 
       - name: "Prepare versions"
         script: |
-          # Важно: без -u (nounset), чтобы не падать, когда APP_VERSION/APP_BUILD не заданы
+          # без -u, чтобы не падать, когда APP_VERSION/APP_BUILD не заданы
           set -eo pipefail
-
-          # BUILD_NUM: из APP_BUILD, иначе timestamp
           if [ -n "${APP_BUILD:-}" ]; then
             BUILD_NUM="$APP_BUILD"
           else
@@ -189,7 +157,6 @@ workflows:
           fi
           echo "BUILD_NUM=$BUILD_NUM" >> "$CM_ENV"
 
-          # APP_VERSION опционально — пишем только если задана
           if [ -n "${APP_VERSION:-}" ]; then
             echo "APP_VERSION=$APP_VERSION" >> "$CM_ENV"
             echo "Planned: CURRENT_PROJECT_VERSION=$BUILD_NUM MARKETING_VERSION=$APP_VERSION"
