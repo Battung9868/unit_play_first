@@ -12,19 +12,19 @@ workflows:
         BUNDLE_ID: io.battung.brightbins
         DEVELOPMENT_TEAM: R35GJ22D76
         SCHEME: Unity-iPhone
-        XCODE_PROJECT: "Unity-iPhone.xcodeproj"    # ← у тебя .xcodeproj в корне
-        PROFILE_NAME: BrightBins                   # точное имя профиля из Dev Portal (НЕ UUID)
-        EXPORT_METHOD: app-store                   # корректное значение для App Store
+        XCODE_PROJECT: "Unity-iPhone.xcodeproj"    # .xcodeproj в корне
+        PROFILE_NAME: BrightBins                   # имя профиля (НЕ UUID)
+        EXPORT_METHOD: app-store                   # для App Store
 
     scripts:
-      - name: Git LFS (Unity бинарники)
+      - name: "Git LFS (Unity бинарники)"
         script: |
           set -eu
           git lfs install
           git lfs fetch
           git lfs checkout
 
-      - name: Импорт сертификата и профиля
+      - name: "Импорт сертификата и профиля"
         script: |
           set -eu
           KEYCHAIN_NAME=codemagic.keychain
@@ -78,7 +78,7 @@ workflows:
             *) echo "⚠️ Профиль может не соответствовать $BUNDLE_ID (проверь тип: App Store и bundle id).";;
           esac
 
-      - name: Sanity: .xcodeproj exists
+      - name: "Sanity: .xcodeproj exists"
         script: |
           set -eu
           echo "PWD=$(pwd)"
@@ -86,7 +86,7 @@ workflows:
           test -d "$XCODE_PROJECT" || { echo "❌ Не найден проект: $XCODE_PROJECT"; exit 1; }
           echo "✅ Найден проект: $XCODE_PROJECT"
 
-      - name: Поднять номер сборки (CFBundleVersion)
+      - name: "Поднять номер сборки (CFBundleVersion)"
         script: |
           set -eu
           INFOPLIST="$(grep -rl --include="Info.plist" "<string>${BUNDLE_ID}</string>" . || true)"
@@ -101,7 +101,7 @@ workflows:
             echo "⚠️ Info.plist не найден — пропускаю"
           fi
 
-      - name: Archive and export IPA (manual signing)
+      - name: "Archive and export IPA (manual signing)"
         script: |
           set -eu
           : "${DEVELOPMENT_TEAM:?Missing DEVELOPMENT_TEAM}"
@@ -117,7 +117,7 @@ workflows:
           CM_EXPORT_DIR="${CM_EXPORT_DIR:-$CM_BUILD_DIR/Export}"
           mkdir -p "$CM_EXPORT_DIR"
 
-          # 1) Архивируем без подписи (чтобы UnityFramework не конфликтовал)
+          # 1) Архивируем без подписи
           eval xcodebuild -resolvePackageDependencies -project \""$XCODE_PROJECT"\" -scheme \""$CHOSEN_SCHEME"\"
           eval xcodebuild archive \
             -project \""$XCODE_PROJECT"\" \
