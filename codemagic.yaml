@@ -13,8 +13,8 @@ workflows:
         DEVELOPMENT_TEAM: R35GJ22D76
         SCHEME: Unity-iPhone
         XCODE_PROJECT: "Unity-iPhone.xcodeproj"    # .xcodeproj в корне
-        PROFILE_NAME: BrightBins                   # имя профиля (НЕ UUID)
-        EXPORT_METHOD: app-store                   # для App Store
+        PROFILE_NAME: BrightBins                   # ИМЯ профиля из Dev Portal (НЕ UUID)
+        EXPORT_METHOD: app-store-connect           # новое название вместо "app-store"
 
     scripts:
       - name: "Git LFS (Unity бинарники)"
@@ -101,7 +101,7 @@ workflows:
             echo "⚠️ Info.plist не найден — пропускаю"
           fi
 
-      - name: "Archive and export IPA (manual signing)"
+      - name: "Archive and export IPA (auto → fallback manual)"
         script: |
           set -eu
           : "${DEVELOPMENT_TEAM:?Missing DEVELOPMENT_TEAM}"
@@ -117,7 +117,7 @@ workflows:
           CM_EXPORT_DIR="${CM_EXPORT_DIR:-$CM_BUILD_DIR/Export}"
           mkdir -p "$CM_EXPORT_DIR"
 
-          # 1) Архивируем без подписи
+          # 1) Архивируем без подписи (чтобы UnityFramework не конфликтовал)
           eval xcodebuild -resolvePackageDependencies -project \""$XCODE_PROJECT"\" -scheme \""$CHOSEN_SCHEME"\"
           eval xcodebuild archive \
             -project \""$XCODE_PROJECT"\" \
@@ -130,8 +130,8 @@ workflows:
             CODE_SIGNING_REQUIRED=NO \
           | tee "$CM_BUILD_DIR/xcodebuild-archive.log"
 
-          # 2) Экспорт с ручным подписанием
-          cat > exportOptions.plist <<EOF
+          # 2) Экспорт с АВТО-подписанием (правильный путь для UnityFramework)
+          cat > exportOptions_auto.plist <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
@@ -141,14 +141,7 @@ workflows:
             <key>teamID</key>
             <string>${DEVELOPMENT_TEAM}</string>
             <key>signingStyle</key>
-            <string>manual</string>
-            <key>signingCertificate</key>
-            <string>Apple Distribution</string>
-            <key>provisioningProfiles</key>
-            <dict>
-              <key>${BUNDLE_ID}</key>
-              <string>${PROFILE_NAME}</string>
-            </dict>
+            <string>automatic</string>
             <key>destination</key>
             <string>export</string>
             <key>compileBitcode</key>
@@ -159,28 +152,65 @@ workflows:
           </plist>
           EOF
 
-          echo "🧾 exportOptions.plist:"; cat exportOptions.plist
-
           set +e
           eval xcodebuild -exportArchive \
             -archivePath \""$ARCHIVE_PATH"\" \
-            -exportOptionsPlist exportOptions.plist \
+            -exportOptionsPlist exportOptions_auto.plist \
             -exportPath \""$CM_EXPORT_DIR"\" \
           | tee "$CM_BUILD_DIR/xcodebuild-export.log"
           XCB_RET=$?
           set -e
 
-          echo "📂 Export dir: $CM_EXPORT_DIR"
-          find "$CM_EXPORT_DIR" -maxdepth 2 -type f -print || true
-
           IPA_PATH="$(find "$CM_EXPORT_DIR" -name '*.ipa' -print -quit || true)"
           if [ $XCB_RET -ne 0 ] || [ -z "$IPA_PATH" ]; then
-            echo "❌ IPA не создана. Лог экспорта (хвост):"
-            tail -n 200 "$CM_BUILD_DIR/xcodebuild-export.log" || true
-            exit 1
+            echo "ℹ️ Авто-подписание не создало IPA. Пробую manual (только для основного app bundle)…"
+            # 3) Fallback: manual-подписание ТОЛЬКО для приложений (без фреймворков)
+            cat > exportOptions_manual.plist <<EOF
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+              <key>method</key>
+              <string>${EXPORT_METHOD}</string>
+              <key>teamID</key>
+              <string>${DEVELOPMENT_TEAM}</string>
+              <key>signingStyle</key>
+              <string>manual</string>
+              <key>provisioningProfiles</key>
+              <dict>
+                <key>${BUNDLE_ID}</key>
+                <string>${PROFILE_NAME}</string>
+              </dict>
+              <key>destination</key>
+              <string>export</string>
+              <key>compileBitcode</key>
+              <false/>
+              <key>uploadBitcode</key>
+              <false/>
+            </dict>
+            </plist>
+            EOF
+
+            set +e
+            eval xcodebuild -exportArchive \
+              -archivePath \""$ARCHIVE_PATH"\" \
+              -exportOptionsPlist exportOptions_manual.plist \
+              -exportPath \""$CM_EXPORT_DIR"\" \
+            | tee -a "$CM_BUILD_DIR/xcodebuild-export.log"
+            XCB_RET=$?
+            set -e
+
+            IPA_PATH="$(find "$CM_EXPORT_DIR" -name '*.ipa' -print -quit || true)"
+            if [ $XCB_RET -ne 0 ] || [ -z "$IPA_PATH" ]; then
+              echo "❌ IPA не создана. Хвост лога экспорта:"
+              tail -n 200 "$CM_BUILD_DIR/xcodebuild-export.log" || true
+              exit 1
+            fi
           fi
 
           echo "✅ IPA создана: $IPA_PATH"
+          echo "📂 Export dir: $CM_EXPORT_DIR"
+          find "$CM_EXPORT_DIR" -maxdepth 2 -type f -print || true
 
     artifacts:
       - $CM_BUILD_DIR/xcodebuild-archive.log
@@ -196,7 +226,6 @@ workflows:
         issuer_id: $APP_STORE_CONNECT_ISSUER_ID
 
         submit_to_testflight: true
-        submit_to_app_store: true            # отправит на App Store Review
-        cancel_previous_submissions: true    # опционально
-        release_type: MANUAL                 # MANUAL | AFTER_APPROVAL | SCHEDULED
-        # earliest_release_date: 2025-10-20T10:00:00+00:00
+        submit_to_app_store: true
+        cancel_previous_submissions: true
+        release_type: MANUAL
