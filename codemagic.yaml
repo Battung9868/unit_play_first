@@ -4,23 +4,32 @@ workflows:
     max_build_duration: 90
 
     environment:
-      unity: "2022.3.62f2"   # ← поставь версию из ProjectSettings/ProjectVersion.txt, если другая
+      # Codemagic сам установит этот редактор и проставит $UNITY_HOME
+      # Подставь версию из ProjectSettings/ProjectVersion.txt при необходимости
+      unity: "2022.3.62f2"
+
       groups:
         - signing            # CERTIFICATE_P12, CERTIFICATE_PASSWORD, MOBILEPROVISION
         - appstore_connect   # APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY
+
       vars:
+        # ---- Unity / iOS export ----
         UNITY_BUILD_DIR: "$CM_BUILD_DIR/Build/iOS"
         UNITY_LOG: "$CM_BUILD_DIR/unity.log"
 
+        # ---- Xcode targets, которые генерирует Unity ----
         XCODE_PROJECT: "$UNITY_BUILD_DIR/Unity-iPhone.xcodeproj"
         XCODE_WORKSPACE: "$UNITY_BUILD_DIR/Unity-iPhone.xcworkspace"
         XCODE_SCHEME: "Unity-iPhone"
 
+        # ---- App identity ----
         BUNDLE_ID: "io.battung.brightbins"
-        TEAM_ID: "OVERRIDE_BY_PROFILE"
+        TEAM_ID: "OVERRIDE_BY_PROFILE"   # заменится TeamIdentifier из профиля
         EXPORT_METHOD: "app-store"
-        # APP_VERSION: "1.1"
-        # APP_BUILD: "123"
+
+        # ---- Версии (опционально) ----
+        # APP_VERSION: "1.1"             # CFBundleShortVersionString
+        # APP_BUILD: "123"               # CFBundleVersion; если не задан — timestamp
 
     cache:
       cache_paths:
@@ -34,20 +43,22 @@ workflows:
       - name: "Unity | Print chosen editor & (optional) activate license"
         script: |
           set -euo pipefail
-          # Codemagic сам ставит Unity и задаёт UNITY_HOME по ключу environment.unity
+
           if [ -z "${UNITY_HOME:-}" ]; then
-            echo "::error::UNITY_HOME is not set. The 'environment.unity' key should auto-install Unity before scripts."
+            echo "::error::UNITY_HOME is not set. Ensure 'environment.unity' is specified."
             exit 1
           fi
+
           UNITY_BIN="$UNITY_HOME/Contents/MacOS/Unity"
           if [ ! -x "$UNITY_BIN" ]; then
             echo "::error::Unity binary not found at $UNITY_BIN"
             exit 1
           fi
+
           echo "Using UNITY_HOME: $UNITY_HOME"
           "$UNITY_BIN" -version || true
 
-          # Активация лицензии — только если заданы креды; иначе пропустим (часто не требуется для экспорта)
+          # Активация лицензии при наличии кредов; иначе пропускаем.
           if [ -n "${UNITY_LICENSE_FILE:-}" ]; then
             echo "Activating via UNITY_LICENSE_FILE..."
             "$UNITY_BIN" -batchmode -nographics -quit -manualLicenseFile "$UNITY_LICENSE_FILE" || true
@@ -61,42 +72,43 @@ workflows:
             echo "No Unity license credentials provided; continuing without explicit activation."
           fi
 
-      - name: "Unity | Ensure CI build script exists"
+      - name: "Unity | Ensure CI build script exists (safe writer)"
         script: |
           set -euo pipefail
           mkdir -p "Assets/Editor"
           CI_FILE="Assets/Editor/CI.cs"
+
           if [ ! -f "$CI_FILE" ]; then
-            cat > "$CI_FILE" <<'EOF'
-            using System.Linq;
-            using UnityEditor;
-            using UnityEditor.Build.Reporting;
-
-            public static class CI
             {
-                public static void BuildiOS()
-                {
-                    var scenes = EditorBuildSettings.scenes
-                        .Where(s => s.enabled)
-                        .Select(s => s.path)
-                        .ToArray();
-
-                    if (scenes.Length == 0)
-                        throw new System.Exception("No enabled scenes in Build Settings.");
-
-                    var options = new BuildPlayerOptions {
-                        scenes = scenes,
-                        target = BuildTarget.iOS,
-                        locationPathName = System.Environment.GetEnvironmentVariable("UNITY_BUILD_DIR") ?? "Build/iOS",
-                        options = BuildOptions.None
-                    };
-
-                    var report = BuildPipeline.BuildPlayer(options);
-                    if (report.summary.result != BuildResult.Succeeded)
-                        throw new System.Exception($"Unity iOS build failed: {report.summary.result}");
-                }
-            }
-            EOF
+              printf '%s\n' 'using System.Linq;'
+              printf '%s\n' 'using UnityEditor;'
+              printf '%s\n' 'using UnityEditor.Build.Reporting;'
+              printf '%s\n' ''
+              printf '%s\n' 'public static class CI'
+              printf '%s\n' '{'
+              printf '%s\n' '    public static void BuildiOS()'
+              printf '%s\n' '    {'
+              printf '%s\n' '        var scenes = EditorBuildSettings.scenes'
+              printf '%s\n' '            .Where(s => s.enabled)'
+              printf '%s\n' '            .Select(s => s.path)'
+              printf '%s\n' '            .ToArray();'
+              printf '%s\n' ''
+              printf '%s\n' '        if (scenes.Length == 0)'
+              printf '%s\n' '            throw new System.Exception("No enabled scenes in Build Settings.");'
+              printf '%s\n' ''
+              printf '%s\n' '        var options = new BuildPlayerOptions {'
+              printf '%s\n' '            scenes = scenes,'
+              printf '%s\n' '            target = BuildTarget.iOS,'
+              printf '%s\n' '            locationPathName = System.Environment.GetEnvironmentVariable("UNITY_BUILD_DIR") ?? "Build/iOS",'
+              printf '%s\n' '            options = BuildOptions.None'
+              printf '%s\n' '        };'
+              printf '%s\n' ''
+              printf '%s\n' '        var report = BuildPipeline.BuildPlayer(options);'
+              printf '%s\n' '        if (report.summary.result != BuildResult.Succeeded)'
+              printf '%s\n' '            throw new System.Exception($"Unity iOS build failed: {report.summary.result}");'
+              printf '%s\n' '    }'
+              printf '%s\n' '}'
+            } > "$CI_FILE"
             echo "CI.cs created for headless build."
           else
             echo "CI.cs already present. Using existing script."
@@ -105,8 +117,10 @@ workflows:
       - name: "Unity | Build iOS Xcode project"
         script: |
           set -euo pipefail
+
           UNITY_BIN="$UNITY_HOME/Contents/MacOS/Unity"
           mkdir -p "$UNITY_BUILD_DIR"
+
           echo "Starting Unity headless build..."
           "$UNITY_BIN" -batchmode -nographics -quit \
             -projectPath "$CM_BUILD_DIR" \
@@ -121,6 +135,19 @@ workflows:
             exit 1
           fi
 
+      - name: "CocoaPods (if Podfile present)"
+        script: |
+          set -euo pipefail
+          if [ -f "$UNITY_BUILD_DIR/Podfile" ]; then
+            echo "Podfile found, running pod install..."
+            pushd "$UNITY_BUILD_DIR" >/dev/null
+            pod repo update
+            pod install --repo-update
+            popd >/dev/null
+          else
+            echo "No Podfile found, skipping CocoaPods."
+          fi
+
       - name: "Import certificate and profile"
         script: |
           set -euo pipefail
@@ -128,6 +155,7 @@ workflows:
           echo "$CERTIFICATE_P12" | base64 --decode > cert.p12
           echo "$MOBILEPROVISION" | base64 --decode > profile.mobileprovision
 
+          # Keychain + certificate
           keychain initialize
           if [ -n "${CERTIFICATE_PASSWORD:-}" ]; then
             keychain add-certificates --certificate cert.p12 --certificate-password "$CERTIFICATE_PASSWORD"
@@ -135,6 +163,7 @@ workflows:
             keychain add-certificates --certificate cert.p12
           fi
 
+          # Install provisioning profile and read UUID + TeamIdentifier
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
           PROFILE_PLIST="$(security cms -D -i profile.mobileprovision)"
           PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print UUID' /dev/stdin <<< "$PROFILE_PLIST")
@@ -144,9 +173,11 @@ workflows:
           echo "Using Provisioning Profile UUID: $PROFILE_UUID"
           echo "TeamIdentifier from profile: $PROFILE_TEAM_ID"
 
+          # export to env for next steps
           echo "PROFILE_UUID=$PROFILE_UUID" >> "$CM_ENV"
           echo "TEAM_ID=$PROFILE_TEAM_ID"   >> "$CM_ENV"
 
+          # exportOptions.plist
           cat > exportOptions.plist <<EOI
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -163,6 +194,7 @@ workflows:
           EOI
           /usr/bin/plutil -lint exportOptions.plist
 
+          # Привязка профиля к проекту/воркспейсу
           if [ -d "$XCODE_WORKSPACE" ]; then
             xcode-project use-profiles --workspace "$XCODE_WORKSPACE" --export-options-plist exportOptions.plist
           else
@@ -172,10 +204,12 @@ workflows:
       - name: "Fix bundle id in generated Xcode project"
         script: |
           set -euo pipefail
+
           INFO_PLIST="$UNITY_BUILD_DIR/Info.plist"
           if [ -f "$INFO_PLIST" ]; then
             /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$INFO_PLIST" || true
           fi
+
           PBXPROJ="$UNITY_BUILD_DIR/Unity-iPhone.xcodeproj/project.pbxproj"
           if [ -f "$PBXPROJ" ]; then
             perl -i -pe "s/PRODUCT_BUNDLE_IDENTIFIER = [^;]+;/PRODUCT_BUNDLE_IDENTIFIER = $BUNDLE_ID;/g" "$PBXPROJ" || true
@@ -184,11 +218,14 @@ workflows:
       - name: "Prepare versions (no Info.plist)"
         script: |
           set -euo pipefail
+
           BUILD_NUM="${APP_BUILD:-$(date +%y%j%H%M%S)}"
           echo "BUILD_NUM=$BUILD_NUM" >> "$CM_ENV"
+
           if [ -n "${APP_VERSION:-}" ]; then
             echo "APP_VERSION=$APP_VERSION" >> "$CM_ENV"
           fi
+
           echo "== Planned versions =="
           echo "MARKETING_VERSION=${APP_VERSION:-(unchanged)}"
           echo "CURRENT_PROJECT_VERSION=$BUILD_NUM"
@@ -196,9 +233,11 @@ workflows:
       - name: "Archive and export IPA (xcodebuild)"
         script: |
           set -euo pipefail
+
           ARCHIVE_PATH="$CM_BUILD_DIR/BrightBins.xcarchive"
           EXPORT_PATH="$CM_EXPORT_DIR"
 
+          # Выбор workspace/project
           XCBUILDTGT=()
           if [ -d "$XCODE_WORKSPACE" ]; then
             echo "Using workspace: $XCODE_WORKSPACE"
