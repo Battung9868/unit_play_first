@@ -7,27 +7,19 @@ workflows:
       groups:
         - signing            # CERTIFICATE_P12, CERTIFICATE_PASSWORD, MOBILEPROVISION
         - appstore_connect   # APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY
-        - unity_credentials  # UNITY_SERIAL (или UNITY_LICENSE_FILE), UNITY_USERNAME, UNITY_PASSWORD — если нужен логин-актив
       vars:
-        # ---- Unity / iOS export ----
-        UNITY_VERSION: "2022.3.XXf1"           # ← задай точную версию Unity проекта
+        UNITY_VERSION: "2022.3.XXf1"           # ← укажи точную версию
         UNITY_BUILD_DIR: "$CM_BUILD_DIR/Build/iOS"
         UNITY_LOG: "$CM_BUILD_DIR/unity.log"
-
-        # ---- Xcode targets from Unity export ----
-        XCODE_PROJECT: "$UNITY_BUILD_DIR/Unity-iPhone.xcodeproj"     # fallback если workspace не создан
-        XCODE_WORKSPACE: "$UNITY_BUILD_DIR/Unity-iPhone.xcworkspace" # используется, если присутствует (Pods)
+        XCODE_PROJECT: "$UNITY_BUILD_DIR/Unity-iPhone.xcodeproj"
+        XCODE_WORKSPACE: "$UNITY_BUILD_DIR/Unity-iPhone.xcworkspace"
         XCODE_SCHEME: "Unity-iPhone"
-
-        # ---- App identity ----
         BUNDLE_ID: "io.battung.brightbins"
-        TEAM_ID: "OVERRIDE_BY_PROFILE"          # будет заменён значением из профиля
+        TEAM_ID: "OVERRIDE_BY_PROFILE"
         EXPORT_METHOD: "app-store"
-
-        # ---- Версии (опционально) ----
-        # APP_VERSION: "1.1"                    # маркетинговая версия (CFBundleShortVersionString)
-        # APP_BUILD: "123"                      # build number (CFBundleVersion), иначе авто-timestamp
-
+        # APP_VERSION: "1.1"
+        # APP_BUILD: "123"
+        
     cache:
       cache_paths:
         - $CM_BUILD_DIR/Library              # Unity Library кэш (ускоряет билд)
