@@ -10,8 +10,8 @@ workflows:
       vars:
         BUNDLE_ID: "io.battung.brightbins"
         EXPORT_METHOD: "app-store"
-        # APP_VERSION: "1.1"     # (опц.) маркетинговая версия
-        # APP_BUILD: "123"       # (опц.) номер билда вручную
+        # APP_VERSION: "1.1"
+        # APP_BUILD: "123"
 
     scripts:
       - name: "Git LFS (для тяжёлых Unity-бинарников)"
@@ -24,7 +24,6 @@ workflows:
       - name: "Import certificate and provisioning profile"
         script: |
           set -euo pipefail
-
           echo "$CERTIFICATE_P12" | base64 --decode > cert.p12
           echo "$MOBILEPROVISION" | base64 --decode > profile.mobileprovision
 
@@ -46,7 +45,6 @@ workflows:
             echo "TEAM_ID=$TEAM_ID"
           } >> "$CM_ENV"
 
-          # exportOptions.plist
           cat > exportOptions.plist <<EOI
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -68,7 +66,7 @@ workflows:
         script: |
           set -euo pipefail
 
-          # 1) ищем .xcworkspace (директория), иначе .xcodeproj (директория)
+          # 1) Ищем директории .xcworkspace / .xcodeproj во всём репо
           TARGET_WS="$(find . -type d -name "*.xcworkspace" -prune -print -quit || true)"
           TARGET_PR="$(find . -type d -name "*.xcodeproj"   -prune -print -quit || true)"
 
@@ -90,7 +88,7 @@ workflows:
             exit 66
           fi
 
-          # 2) CocoaPods при наличии Podfile
+          # 2) CocoaPods (если есть Podfile)
           if [ -f "Podfile" ]; then
             gem install cocoapods --no-document
             pod repo update
@@ -102,32 +100,37 @@ workflows:
             fi
           fi
 
-          # 3) соберём список схем (текстовый вывод)
+          # 3) Получаем список схем (текстовый вывод)
           if [ -n "${XCODE_WORKSPACE:-}" ]; then
-            LIST_TXT="$(xcodebuild -workspace "$XCODE_WORKSPACE" -list 2>/dev/null || true)"
+            xcodebuild -workspace "$XCODE_WORKSPACE" -list 2>/dev/null || true > /tmp/xclist.txt
           else
-            LIST_TXT="$(xcodebuild -project "$XCODE_PROJECT" -list 2>/dev/null || true)"
+            xcodebuild -project "$XCODE_PROJECT" -list 2>/dev/null || true > /tmp/xclist.txt
           fi
-          printf '%s\n' "$LIST_TXT" > /tmp/xclist.txt || true
+          awk '/Schemes:/{flag=1;next} flag && NF {print}' /tmp/xclist.txt | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' > /tmp/schemes.txt
 
-          # все схемы построчно
-          mapfile -t ALL_SCHEMES < <(awk '/Schemes:/{flag=1;next} flag && NF {print}' /tmp/xclist.txt | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          if [ ! -s /tmp/schemes.txt ]; then
+            echo "❌ No shared schemes found. Enable 'Shared' in Xcode." >&2
+            echo "xcodebuild -list output for debug:" >&2
+            cat /tmp/xclist.txt >&2
+            exit 66
+          fi
 
-          # 4) приоритет выбора схемы:
-          #   а) "Unity-iPhone" если есть
-          #   б) первая схема, у которой WRAPPER_EXTENSION=app (приложение)
-          #   в) иначе первая из списка
+          # 4) Выбираем схему: Unity-iPhone > любая с WRAPPER_EXTENSION=app > первая
           XCODE_SCHEME=""
+          FIRST_SCHEME=""
 
-          for s in "${ALL_SCHEMES[@]}"; do
+          # 4a) перебирать строки БЕЗ mapfile
+          while IFS= read -r s; do
+            [ -z "$FIRST_SCHEME" ] && FIRST_SCHEME="$s"
             if [ "$s" = "Unity-iPhone" ]; then
               XCODE_SCHEME="$s"
               break
             fi
-          done
+          done < /tmp/schemes.txt
 
+          # 4b) если не нашли Unity-iPhone — ищем любую app-схему
           if [ -z "$XCODE_SCHEME" ]; then
-            for s in "${ALL_SCHEMES[@]}"; do
+            while IFS= read -r s; do
               if [ -n "${XCODE_WORKSPACE:-}" ]; then
                 if xcodebuild -workspace "$XCODE_WORKSPACE" -scheme "$s" -showBuildSettings 2>/dev/null | grep -q "WRAPPER_EXTENSION = app"; then
                   XCODE_SCHEME="$s"; break
@@ -137,17 +140,12 @@ workflows:
                   XCODE_SCHEME="$s"; break
                 fi
               fi
-            done
+            done < /tmp/schemes.txt
           fi
 
-          if [ -z "$XCODE_SCHEME" ] && [ "${#ALL_SCHEMES[@]}" -gt 0 ]; then
-            XCODE_SCHEME="${ALL_SCHEMES[0]}"
-          fi
-
+          # 4c) иначе берём первую
           if [ -z "$XCODE_SCHEME" ]; then
-            echo "❌ No shared schemes found. Enable 'Shared' in Xcode." >&2
-            printf 'xcodebuild -list output:\n%s\n' "$LIST_TXT"
-            exit 66
+            XCODE_SCHEME="$FIRST_SCHEME"
           fi
 
           echo "Detected scheme: $XCODE_SCHEME"
@@ -156,22 +154,17 @@ workflows:
       - name: "Patch Unity 'Run Script' phases that break CI"
         script: |
           set -euo pipefail
-          # Отключаем PBXShellScriptBuildPhase с именем "Run Script" (НЕ трогаем [CP] у Pods)
           if [ -n "${XCODE_PROJECT:-}" ]; then
             PBXPROJ="$XCODE_PROJECT/project.pbxproj"
           else
-            # workspace -> project с тем же именем
             PNAME="$(basename "$XCODE_WORKSPACE" .xcworkspace)"
             PBXPROJ="$PNAME.xcodeproj/project.pbxproj"
           fi
-
           if [ ! -f "$PBXPROJ" ]; then
             echo "⚠️  project.pbxproj not found at $PBXPROJ, skip patch"; exit 0
           fi
 
           cp "$PBXPROJ" "$PBXPROJ.bak"
-
-          # Меняем содержимое shellScript для фаз с name = "Run Script"
           awk '
             /isa = PBXShellScriptBuildPhase;/ {inblk=1}
             inblk && /name = "Run Script";/ {mark=1}
@@ -182,7 +175,6 @@ workflows:
             inblk && /};/ {inblk=0; mark=0}
             {print}
           ' "$PBXPROJ" > "$PBXPROJ.patched"
-
           mv "$PBXPROJ.patched" "$PBXPROJ"
           echo "Patched PBXShellScriptBuildPhase \"Run Script\" → echo Skipped"
 
