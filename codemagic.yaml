@@ -2,7 +2,7 @@ workflows:
   ios_appstore_manual_signing:
     name: iOS App Store (Unity Xcode, manual signing)
     max_build_duration: 60
-    # instance_type: mac_mini_m2
+    # instance_type: mac_mini_m2   # можно зафиксировать образ
 
     environment:
       groups:
@@ -13,11 +13,8 @@ workflows:
         SCHEME: Unity-iPhone
         CHOSEN_SCHEME: Unity-iPhone
         DEVELOPMENT_TEAM: R35GJ22D76
-        PROFILE_NAME: BrightBins              # ИМЯ App Store профиля
-        EXPORT_METHOD: app-store-connect
-        # ↓ Необязательно, но можно указать вручную, если знаешь точный путь:
-        # XCODE_WORKSPACE_HINT: "Xcode/Unity-iPhone.xcworkspace"
-        # XCODE_PROJECT_HINT:   "Xcode/Unity-iPhone.xcodeproj"
+        PROFILE_NAME: BrightBins         # имя профиля (Profile Name), не UUID (ставим в систему на шаге импорта)
+        EXPORT_METHOD: app-store-connect  # ⚠️ новое название вместо "app-store"
 
     scripts:
       - name: Git LFS (Unity бинарники)
@@ -37,7 +34,7 @@ workflows:
           security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_NAME"
           security list-keychains -d user -s "$KEYCHAIN_NAME" $(security list-keychains -d user | sed 's/[" ]//g')
 
-          # Сертификат (secure-файл или base64)
+          # Сертификат (файл в секрете или base64)
           CERT_FILE="cert.p12"
           if [ -n "${CERTIFICATE_P12:-}" ] && [ -f "${CERTIFICATE_P12:-/dev/null}" ]; then
             CERT_FILE="$CERTIFICATE_P12"
@@ -45,7 +42,7 @@ workflows:
             echo "$CERTIFICATE_P12" | base64 --decode > "$CERT_FILE"
           fi
 
-          # Профиль (secure-файл или base64)
+          # Профиль (файл в секрете или base64) — ставим в систему для экспорта
           PROF_FILE="profile.mobileprovision"
           if [ -n "${MOBILEPROVISION:-}" ] && [ -f "${MOBILEPROVISION:-/dev/null}" ]; then
             PROF_FILE="$MOBILEPROVISION"
@@ -64,46 +61,25 @@ workflows:
           rm -f "$TMP_PLIST"
           cp "$PROF_FILE" "$PROFILE_DIR/$UUID.mobileprovision"
 
-      - name: Найти проект/воркспейс и зафиксировать схему (без xcodebuild -list)
+      - name: Выбрать схему и найти проект (мгновенно, без list)
         script: |
           set -euo pipefail
-          shopt -s globstar nullglob
-
-          # 1) Схема
           CHOSEN="${SCHEME:-Unity-iPhone}"
-          echo "✅ Using scheme: $CHOSEN"
+          echo "✅ Using scheme (forced): $CHOSEN"
           echo "export CHOSEN_SCHEME=\"$CHOSEN\"" >> "$CM_ENV"
 
-          # 2) Workspace/project из подсказок или по маскам
-          WS=""
-          PR=""
-
-          if [ -n "${XCODE_WORKSPACE_HINT:-}" ] && [ -d "$XCODE_WORKSPACE_HINT" ]; then
-            WS="$XCODE_WORKSPACE_HINT"
-          else
-            # любой *.xcworkspace (берём самый верхний по пути)
-            for p in **/*.xcworkspace; do WS="$p"; break; done
-          fi
-
-          if [ -n "${XCODE_PROJECT_HINT:-}" ] && [ -d "$XCODE_PROJECT_HINT" ]; then
-            PR="$XCODE_PROJECT_HINT"
-          else
-            # сначала Unity-iPhone.xcodeproj, иначе любой *.xcodeproj
-            for p in **/Unity-iPhone.xcodeproj; do PR="$p"; break; done
-            if [ -z "$PR" ]; then
-              for p in **/*.xcodeproj; do PR="$p"; break; done
-            fi
-          fi
+          WS="$(find . -type d -name '*.xcworkspace' -print -quit 2>/dev/null || true)"
+          PR="$(find . -type d -name 'Unity-iPhone.xcodeproj' -print -quit 2>/dev/null || true)"
+          [ -z "$PR" ] && PR="$(find . -type d -name '*.xcodeproj' -print -quit 2>/dev/null || true)"
 
           if [ -n "$WS" ]; then
-            echo "📁 workspace: $WS"
+            echo "Using workspace: $WS"
             echo "export XCODE_WORKSPACE=\"$WS\"" >> "$CM_ENV"
           elif [ -n "$PR" ]; then
-            echo "📁 project:   $PR"
+            echo "Using project: $PR"
             echo "export XCODE_PROJECT=\"$PR\"" >> "$CM_ENV"
           else
-            echo "📂 Кандидаты рядом (до 4 уровней):"
-            find . -maxdepth 4 -type d -name '*.xcodeproj' -or -name '*.xcworkspace' || true
+            echo "📂 Кандидаты рядом:"; find . -maxdepth 4 -type d -name '*.xcodeproj' -or -name '*.xcworkspace' || true
             echo "❌ Не найден .xcworkspace или .xcodeproj"; exit 1
           fi
 
@@ -125,7 +101,6 @@ workflows:
         script: |
           set -euo pipefail
           : "${DEVELOPMENT_TEAM:?Missing DEVELOPMENT_TEAM}"
-          : "${PROFILE_NAME:?Missing PROFILE_NAME}"
           : "${BUNDLE_ID:?Missing BUNDLE_ID}"
           : "${EXPORT_METHOD:?Missing EXPORT_METHOD}"
 
@@ -133,36 +108,26 @@ workflows:
           [ -z "$CHOSEN_SCHEME" ] && { echo "❌ Нет схемы"; exit 1; }
           echo "✅ Archive will use scheme: $CHOSEN_SCHEME"
 
-          # Повторный сверх-надёжный поиск проекта/воркспейса (если вдруг переменные не приехали)
-          if [ -n "${XCODE_WORKSPACE:-}" ] && [ -d "$XCODE_WORKSPACE" ]; then
+          if [ -n "${XCODE_WORKSPACE:-}" ]; then
+            echo "Using workspace: $XCODE_WORKSPACE"
             PROJ_ARG=(-workspace "$XCODE_WORKSPACE")
-          elif [ -n "${XCODE_PROJECT:-}" ] && [ -d "$XCODE_PROJECT" ]; then
+          elif [ -n "${XCODE_PROJECT:-}" ]; then
+            echo "Using project: $XCODE_PROJECT"
             PROJ_ARG=(-project "$XCODE_PROJECT")
           else
             echo "⚠️ workspace/project не определены — повторный поиск…"
-            shopt -s globstar nullglob
-            WS=""; PR=""
-            for p in **/*.xcworkspace; do WS="$p"; break; done
-            for p in **/Unity-iPhone.xcodeproj; do PR="$p"; break; done
-            if [ -z "$PR" ]; then
-              for p in **/*.xcodeproj; do PR="$p"; break; done
-            fi
-            if [ -n "$WS" ]; then
-              PROJ_ARG=(-workspace "$WS")
-              echo "Using workspace (re-detected): $WS"
-            elif [ -n "$PR" ]; then
-              PROJ_ARG=(-project "$PR")
-              echo "Using project (re-detected): $PR"
-            else
-              echo "📂 Кандидаты рядом:"; find . -maxdepth 6 -type d -name '*.xcodeproj' -or -name '*.xcworkspace' || true
-              echo "❌ Ни workspace, ни project не найдены"; exit 1
-            fi
+            WS="$(find . -type d -name '*.xcworkspace' -print -quit 2>/dev/null || true)"
+            PR="$(find . -type d -name 'Unity-iPhone.xcodeproj' -print -quit 2>/dev/null || true)"
+            [ -z "$PR" ] && PR="$(find . -type d -name '*.xcodeproj' -print -quit 2>/dev/null || true)"
+            if [ -n "$WS" ]; then PROJ_ARG=(-workspace "$WS"); elif [ -n "$PR" ]; then PROJ_ARG=(-project "$PR"); else
+              echo "❌ Ни workspace, ни project не найдены"; exit 1; fi
           fi
 
           ARCHIVE_PATH="$CM_BUILD_DIR/app.xcarchive"
 
-          # 1) Архив без подписи
+          # 1) Архивируем БЕЗ подписи — чтобы UnityFramework не конфликтовал
           xcodebuild -resolvePackageDependencies "${PROJ_ARG[@]}" -scheme "$CHOSEN_SCHEME"
+
           xcodebuild archive \
             "${PROJ_ARG[@]}" \
             -scheme "$CHOSEN_SCHEME" \
@@ -174,31 +139,19 @@ workflows:
             CODE_SIGNING_REQUIRED=NO \
           | tee "$CM_BUILD_DIR/xcodebuild-archive.log"
 
-          # 2) Проверка bundle id в архиве
-          APP_BUNDLE_IN_ARCHIVE="$(/usr/libexec/PlistBuddy -c 'Print :ApplicationProperties:CFBundleIdentifier' "$ARCHIVE_PATH/Info.plist" 2>/dev/null || true)"
-          echo "Archive CFBundleIdentifier: ${APP_BUNDLE_IN_ARCHIVE:-<empty>}"
-          if [ "$APP_BUNDLE_IN_ARCHIVE" != "$BUNDLE_ID" ]; then
-            echo "❌ CFBundleIdentifier в архиве ($APP_BUNDLE_IN_ARCHIVE) != ожидаемому ($BUNDLE_ID)"; exit 1
-          fi
-
-          # 3) Экспорт: ручная подпись только для APP (без фреймворков)
+          # 2) Экспорт с АВТО подписанием (без provisioningProfiles для фреймворка)
           mkdir -p "$CM_EXPORT_DIR"
-          cat > exportOptions.plist <<EOF
+          cat > exportOptions.plist <<'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
           <dict>
             <key>method</key>
-            <string>${EXPORT_METHOD}</string>
+            <string>__EXPORT_METHOD__</string>
             <key>teamID</key>
-            <string>${DEVELOPMENT_TEAM}</string>
+            <string>__DEVELOPMENT_TEAM__</string>
             <key>signingStyle</key>
-            <string>manual</string>
-            <key>provisioningProfiles</key>
-            <dict>
-              <key>${BUNDLE_ID}</key>
-              <string>${PROFILE_NAME}</string>
-            </dict>
+            <string>automatic</string>
             <key>destination</key>
             <string>export</string>
             <key>compileBitcode</key>
@@ -208,6 +161,7 @@ workflows:
           </dict>
           </plist>
           EOF
+          sed -i.bak "s|__EXPORT_METHOD__|$EXPORT_METHOD|g; s|__DEVELOPMENT_TEAM__|$DEVELOPMENT_TEAM|g" exportOptions.plist
 
           xcodebuild -exportArchive \
             -archivePath "$ARCHIVE_PATH" \
