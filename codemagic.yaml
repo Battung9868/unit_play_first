@@ -1,233 +1,46 @@
 workflows:
-  unity_ios_appstore_manual_signing:
-    name: Unity ➜ iOS ➜ TestFlight (manual signing)
-    max_build_duration: 90
+  ios_appstore_manual_signing:
+    name: iOS App Store Manual signing (Unity Xcode export)
+    max_build_duration: 60
 
     environment:
-      # Codemagic сам установит Unity и задаст $UNITY_HOME
-      # Поставь точную версию из ProjectSettings/ProjectVersion.txt
-      unity: "2022.3.62f2"
-
       groups:
         - signing            # CERTIFICATE_P12, CERTIFICATE_PASSWORD, MOBILEPROVISION
         - appstore_connect   # APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY
-
       vars:
-        # Только реально заданные значения — без пустых строк!
-        UNITY_LOG: "$CM_BUILD_DIR/unity.log"
-        XCODE_SCHEME: "Unity-iPhone"
-        BUNDLE_ID: "io.battung.brightbins"
-        TEAM_ID: "OVERRIDE_BY_PROFILE"   # заменится TeamIdentifier из профиля
-        EXPORT_METHOD: "app-store"
-        # APP_VERSION: "1.1"             # опц.
-        # APP_BUILD: "123"               # опц.
+        # Если у вас есть Workspace (Pods) — XCODE_WORKSPACE будет найден автоматически.
+        # Оставляем твои значения:
+        XCODE_PROJECT: "GrainFlow.xcodeproj"
+        XCODE_SCHEME: "GrainFlow"
+        BUNDLE_ID: "com.GrainFlow.hamzimdin"
 
-    cache:
-      cache_paths:
-        - $CM_BUILD_DIR/Library
-        - $CM_BUILD_DIR/Logs
-        - $CM_BUILD_DIR/Packages
-        - $HOME/Library/Caches/CocoaPods
-        - $HOME/Library/Developer/Xcode/DerivedData
+        # TEAM_ID возьмём из mobileprovision (OVERRIDE_BY_PROFILE — заглушка до парсинга).
+        TEAM_ID: "OVERRIDE_BY_PROFILE"
+
+        # Публикация в App Store
+        EXPORT_METHOD: "app-store"
+
+        # Можно задать вручную из UI Codemagic при необходимости:
+        # APP_VERSION: "1.1"
+        # APP_BUILD: "123"
 
     scripts:
-      - name: "Unity | Ensure editor & print version"
+      - name: "Git LFS (обязательно для больших Unity-бинарников)"
         script: |
           set -euo pipefail
-          if [ -z "${UNITY_HOME:-}" ]; then
-            echo "::error::UNITY_HOME is not set. Ensure 'environment.unity' is specified."
-            exit 1
-          fi
-          UNITY_BIN="$UNITY_HOME/Contents/MacOS/Unity"
-          if [ ! -x "$UNITY_BIN" ]; then
-            echo "::error::Unity binary not found at $UNITY_BIN"
-            exit 1
-          fi
-          echo "Using UNITY_HOME: $UNITY_HOME"
-          "$UNITY_BIN" -version || true
-          echo "UNITY_BIN=$UNITY_BIN" >> "$CM_ENV"
+          git lfs install
+          git lfs fetch
+          git lfs checkout
 
-      - name: "Unity | License — activate or create ALF"
-        script: |
-          set -euo pipefail
-          UNITY_BIN="$UNITY_HOME/Contents/MacOS/Unity"
-          LIC_DIR="$CM_BUILD_DIR/licensing"
-          mkdir -p "$LIC_DIR"
-
-          if [ -n "${UNITY_LICENSE_FILE:-}" ]; then
-            echo "UNITY_LICENSE_FILE provided. Applying .ulf..."
-            echo "$UNITY_LICENSE_FILE" | base64 --decode > "$LIC_DIR/Unity.ulf"
-            # попытка применить .ulf (Unity иногда возвращает 0 даже при успешном применении)
-            "$UNITY_BIN" -batchmode -nographics -quit -manualLicenseFile "$LIC_DIR/Unity.ulf" || true
-            echo "License file applied (best-effort)."
-          elif [ -n "${UNITY_SERIAL:-}" ] && { [ -n "${UNITY_USERNAME:-}" ] || [ -n "${UNITY_EMAIL:-}" ]; } && [ -n "${UNITY_PASSWORD:-}" ]; then
-            USER="${UNITY_USERNAME:-${UNITY_EMAIL:-}}"
-            echo "Serial-based activation..."
-            "$UNITY_BIN" -batchmode -nographics -quit \
-              -serial "$UNITY_SERIAL" \
-              -username "$USER" \
-              -password "$UNITY_PASSWORD" || true
-            echo "Serial activation attempted."
-          else
-            echo "No license creds provided. Creating manual activation file (.alf)..."
-            set +e
-            "$UNITY_BIN" -batchmode -nographics -quit -createManualActivationFile
-            RC=$?
-            set -e
-            # Ищем *.alf в стандартных местах
-            ALF="$(ls -1t "$CM_BUILD_DIR"/Unity_*.alf 2>/dev/null | head -n1 || true)"
-            [ -z "$ALF" ] && ALF="$(ls -1t "$HOME"/Unity_*.alf 2>/dev/null | head -n1 || true)"
-            [ -z "$ALF" ] && ALF="$(ls -1t "$HOME"/Library/Unity/Unity_*.alf 2>/dev/null | head -n1 || true)"
-            if [ -n "$ALF" ]; then
-              cp "$ALF" "$LIC_DIR/Unity_v2022.alf"
-              echo "ALF created at: $LIC_DIR/Unity_v2022.alf"
-            else
-              echo "::warning::Could not locate ALF automatically. Listing possible .alf files:"
-              find "$HOME" -maxdepth 4 -name "*.alf" -print || true
-            fi
-            echo "::error::Unity license is required. Download .ULF from license.unity3d.com using the ALF artifact and set UNITY_LICENSE_FILE (base64) in Codemagic."
-            exit 1
-          fi
-
-      - name: "Detect Unity project root & set paths"
-        script: |
-          set -euo pipefail
-          detect_project_dir() {
-            if [ -d "$CM_BUILD_DIR/Assets" ] && [ -d "$CM_BUILD_DIR/ProjectSettings" ]; then
-              echo "$CM_BUILD_DIR"; return
-            fi
-            found="$(find "$CM_BUILD_DIR" -maxdepth 2 -type d -name Assets -prune -print | while read -r a; do
-              d="$(dirname "$a")"
-              if [ -d "$d/ProjectSettings" ]; then echo "$d"; fi
-            done | head -n1)"
-            if [ -n "$found" ]; then echo "$found"; return; fi
-            found="$(find "$CM_BUILD_DIR" -type d -name ProjectSettings -print | while read -r ps; do
-              d="$(dirname "$ps")"
-              if [ -d "$d/Assets" ]; then echo "$d"; fi
-            done | head -n1)"
-            if [ -n "$found" ]; then echo "$found"; return; fi
-            echo ""
-          }
-
-          UNITY_PROJECT_DIR="$(detect_project_dir)"
-          if [ -z "$UNITY_PROJECT_DIR" ]; then
-            echo "::error::Cannot locate Unity project (Assets/ and ProjectSettings/ not found)."
-            exit 1
-          fi
-          echo "Unity project detected at: $UNITY_PROJECT_DIR"
-
-          UNITY_BUILD_DIR="$UNITY_PROJECT_DIR/Build/iOS"
-          XCODE_PROJECT="$UNITY_BUILD_DIR/Unity-iPhone.xcodeproj"
-          XCODE_WORKSPACE="$UNITY_BUILD_DIR/Unity-iPhone.xcworkspace"
-
-          {
-            echo "UNITY_PROJECT_DIR=$UNITY_PROJECT_DIR"
-            echo "UNITY_BUILD_DIR=$UNITY_BUILD_DIR"
-            echo "XCODE_PROJECT=$XCODE_PROJECT"
-            echo "XCODE_WORKSPACE=$XCODE_WORKSPACE"
-          } >> "$CM_ENV"
-
-      - name: "Unity | Ensure CI.cs (safe writer)"
-        script: |
-          set -euo pipefail
-          mkdir -p "$UNITY_PROJECT_DIR/Assets/Editor"
-          CI_FILE="$UNITY_PROJECT_DIR/Assets/Editor/CI.cs"
-          if [ ! -f "$CI_FILE" ]; then
-            {
-              printf '%s\n' 'using System.Linq;'
-              printf '%s\n' 'using UnityEditor;'
-              printf '%s\n' 'using UnityEditor.Build.Reporting;'
-              printf '%s\n' 'using UnityEditor.SceneManagement;'
-              printf '%s\n' 'using UnityEngine;'
-              printf '%s\n' ''
-              printf '%s\n' 'public static class CI'
-              printf '%s\n' '{'
-              printf '%s\n' '    public static void BuildiOS()'
-              printf '%s\n' '    {'
-              printf '%s\n' '        var enabledScenes = EditorBuildSettings.scenes.Where(s => s.enabled).Select(s => s.path).ToArray();'
-              printf '%s\n' '        string[] scenes = enabledScenes.Length > 0 ? enabledScenes :'
-              printf '%s\n' '            AssetDatabase.FindAssets("t:Scene")'
-              printf '%s\n' '                .Select(AssetDatabase.GUIDToAssetPath)'
-              printf '%s\n' '                .OrderBy(p => p)'
-              printf '%s\n' '                .ToArray();'
-              printf '%s\n' ''
-              printf '%s\n' '        if (scenes.Length == 0)'
-              printf '%s\n' '            throw new System.Exception("No scenes found to build.");'
-              printf '%s\n' ''
-              printf '%s\n' '        var outDir = System.Environment.GetEnvironmentVariable("UNITY_BUILD_DIR");'
-              printf '%s\n' '        if (string.IsNullOrEmpty(outDir)) outDir = "Build/iOS";'
-              printf '%s\n' ''
-              printf '%s\n' '        EditorUserBuildSettings.SwitchActiveBuildTarget(BuildTargetGroup.iOS, BuildTarget.iOS);'
-              printf '%s\n' ''
-              printf '%s\n' '        var options = new BuildPlayerOptions {'
-              printf '%s\n' '            scenes = scenes,'
-              printf '%s\n' '            target = BuildTarget.iOS,'
-              printf '%s\n' '            locationPathName = outDir,'
-              printf '%s\n' '            options = BuildOptions.None'
-              printf '%s\n' '        };'
-              printf '%s\n' ''
-              printf '%s\n' '        var report = BuildPipeline.BuildPlayer(options);'
-              printf '%s\n' '        if (report.summary.result != BuildResult.Succeeded)'
-              printf '%s\n' '            throw new System.Exception($"Unity iOS build failed: {report.summary.result}");'
-              printf '%s\n' '    }'
-              printf '%s\n' '}'
-            } > "$CI_FILE"
-            echo "CI.cs created at $CI_FILE"
-          else
-            echo "CI.cs already exists: $CI_FILE"
-          fi
-
-      - name: "Unity | Build iOS Xcode project (always dump log on failure)"
-        script: |
-          set -euo pipefail
-          UNITY_BIN="$UNITY_HOME/Contents/MacOS/Unity"
-          mkdir -p "$UNITY_BUILD_DIR"
-
-          echo "Starting Unity headless build..."
-          set +e
-          "$UNITY_BIN" -batchmode -nographics \
-            -projectPath "$UNITY_PROJECT_DIR" \
-            -executeMethod CI.BuildiOS \
-            -buildTarget iOS \
-            -logFile "$UNITY_LOG" \
-            -quit
-          UNITY_RC=$?
-          set -e
-
-          echo "==== Last 200 lines of Unity log ===="
-          tail -n 200 "$UNITY_LOG" || true
-          echo "====================================="
-
-          if [ $UNITY_RC -ne 0 ]; then
-            echo "::error::Unity exited with code $UNITY_RC"
-            exit $UNITY_RC
-          fi
-
-          if [ ! -d "$UNITY_BUILD_DIR" ]; then
-            echo "::error::Unity did not produce Xcode project at $UNITY_BUILD_DIR"
-            exit 1
-          fi
-
-      - name: "CocoaPods (if Podfile present)"
-        script: |
-          set -euo pipefail
-          if [ -f "$UNITY_BUILD_DIR/Podfile" ]; then
-            echo "Podfile found, running pod install..."
-            pushd "$UNITY_BUILD_DIR" >/dev/null
-            pod repo update
-            pod install --repo-update
-            popd >/dev/null
-          else
-            echo "No Podfile found, skipping CocoaPods."
-          fi
-
-      - name: "Import certificate and profile"
+      - name: "Import certificate and provisioning profile"
         script: |
           set -euo pipefail
 
+          # Декодируем секреты
           echo "$CERTIFICATE_P12" | base64 --decode > cert.p12
           echo "$MOBILEPROVISION" | base64 --decode > profile.mobileprovision
 
+          # Кейчейн и сертификат
           keychain initialize
           if [ -n "${CERTIFICATE_PASSWORD:-}" ]; then
             keychain add-certificates --certificate cert.p12 --certificate-password "$CERTIFICATE_PASSWORD"
@@ -235,6 +48,7 @@ workflows:
             keychain add-certificates --certificate cert.p12
           fi
 
+          # Установка профиля и чтение UUID/TeamIdentifier
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
           PROFILE_PLIST="$(security cms -D -i profile.mobileprovision)"
           PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print UUID' /dev/stdin <<< "$PROFILE_PLIST")
@@ -244,9 +58,13 @@ workflows:
           echo "Using Provisioning Profile UUID: $PROFILE_UUID"
           echo "TeamIdentifier from profile: $PROFILE_TEAM_ID"
 
-          echo "PROFILE_UUID=$PROFILE_UUID" >> "$CM_ENV"
-          echo "TEAM_ID=$PROFILE_TEAM_ID"   >> "$CM_ENV"
+          # Экспортируем для следующих шагов
+          {
+            echo "PROFILE_UUID=$PROFILE_UUID"
+            echo "TEAM_ID=$PROFILE_TEAM_ID"
+          } >> "$CM_ENV"
 
+          # Готовим exportOptions.plist
           cat > exportOptions.plist <<EOI
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -257,106 +75,115 @@ workflows:
             <key>provisioningProfiles</key><dict>
               <key>${BUNDLE_ID}</key><string>${PROFILE_UUID}</string>
             </dict>
+            <key>compileBitcode</key><false/>
             <key>stripSwiftSymbols</key><true/>
             <key>destination</key><string>export</string>
           </dict></plist>
           EOI
           /usr/bin/plutil -lint exportOptions.plist
 
-          if [ -d "$XCODE_WORKSPACE" ]; then
-            xcode-project use-profiles --workspace "$XCODE_WORKSPACE" --export-options-plist exportOptions.plist
-          else
+          # Применяем профиль к проекту (утилита Codemagic)
+          if [ -n "${XCODE_PROJECT:-}" ] && [ -f "$XCODE_PROJECT" ]; then
             xcode-project use-profiles --project "$XCODE_PROJECT" --export-options-plist exportOptions.plist
           fi
 
-      - name: "Fix bundle id in generated Xcode project"
+      - name: "Install CocoaPods if needed (Unity export may have Podfile)"
         script: |
           set -euo pipefail
-          INFO_PLIST="$UNITY_BUILD_DIR/Info.plist"
-          if [ -f "$INFO_PLIST" ]; then
-            /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$INFO_PLIST" || true
-          fi
-          PBXPROJ="$UNITY_BUILD_DIR/Unity-iPhone.xcodeproj/project.pbxproj"
-          if [ -f "$PBXPROJ" ]; then
-            perl -i -pe "s/PRODUCT_BUNDLE_IDENTIFIER = [^;]+;/PRODUCT_BUNDLE_IDENTIFIER = $BUNDLE_ID;/g" "$PBXPROJ" || true
+          if [ -f "Podfile" ]; then
+            gem install cocoapods --no-document
+            pod repo update
+            pod install
+          else
+            echo "No Podfile found — skipping CocoaPods."
           fi
 
-      - name: "Prepare versions (no Info.plist)"
+      - name: "Prepare versions (no direct Info.plist edits)"
         script: |
           set -euo pipefail
           BUILD_NUM="${APP_BUILD:-$(date +%y%j%H%M%S)}"
           echo "BUILD_NUM=$BUILD_NUM" >> "$CM_ENV"
+
           if [ -n "${APP_VERSION:-}" ]; then
             echo "APP_VERSION=$APP_VERSION" >> "$CM_ENV"
           fi
+
           echo "== Planned versions =="
           echo "MARKETING_VERSION=${APP_VERSION:-(unchanged)}"
           echo "CURRENT_PROJECT_VERSION=$BUILD_NUM"
 
-      - name: "Archive and export IPA (xcodebuild)"
+      - name: "Archive and export IPA (auto-detect workspace/project)"
         script: |
           set -euo pipefail
-          ARCHIVE_PATH="$CM_BUILD_DIR/BrightBins.xcarchive"
-          EXPORT_PATH="$CM_EXPORT_DIR"
 
-          XCBUILDTGT=()
-          if [ -d "$XCODE_WORKSPACE" ]; then
-            echo "Using workspace: $XCODE_WORKSPACE"
-            XCBUILDTGT=( -workspace "$XCODE_WORKSPACE" )
+          ARCHIVE_PATH="$CM_BUILD_DIR/App.xcarchive"
+          EXPORT_PATH="$CM_EXPORT_DIR"
+          SCHEME="${XCODE_SCHEME}"
+
+          # Если после pod install появился workspace — используем его
+          if ls ./*.xcworkspace >/dev/null 2>&1; then
+            XCODE_WORKSPACE="$(ls -1 *.xcworkspace | head -n1)"
+            echo "Detected workspace: $XCODE_WORKSPACE"
+            USE_WORKSPACE=1
+          elif [ -n "${XCODE_WORKSPACE:-}" ] && [ -f "$XCODE_WORKSPACE" ]; then
+            echo "Using provided workspace: $XCODE_WORKSPACE"
+            USE_WORKSPACE=1
           else
             echo "Using project: $XCODE_PROJECT"
-            XCBUILDTGT=( -project "$XCODE_PROJECT" )
+            USE_WORKSPACE=0
           fi
 
-          EXTRA_FLAGS=( CURRENT_PROJECT_VERSION="$BUILD_NUM" PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" )
+          # Версионные флаги напрямую в xcodebuild (не трогаем plist)
+          EXTRA_FLAGS=( CURRENT_PROJECT_VERSION="$BUILD_NUM" )
           if [ -n "${APP_VERSION:-}" ]; then
             EXTRA_FLAGS+=( MARKETING_VERSION="$APP_VERSION" )
           fi
 
           echo "Archiving to: $ARCHIVE_PATH"
-          xcodebuild \
-            "${XCBUILDTGT[@]}" \
-            -scheme "$XCODE_SCHEME" \
-            -configuration Release \
-            -archivePath "$ARCHIVE_PATH" \
-            archive \
-            DEVELOPMENT_TEAM="$TEAM_ID" \
-            CODE_SIGN_STYLE=Manual \
-            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_UUID" \
-            CODE_SIGN_IDENTITY="Apple Distribution" \
-            COMPILER_INDEX_STORE_ENABLE=NO \
-            "${EXTRA_FLAGS[@]}"
+          if [ "$USE_WORKSPACE" -eq 1 ]; then
+            xcodebuild \
+              -workspace "$XCODE_WORKSPACE" \
+              -scheme "$SCHEME" \
+              -configuration Release \
+              -archivePath "$ARCHIVE_PATH" \
+              -destination "generic/platform=iOS" \
+              archive \
+              DEVELOPMENT_TEAM="$TEAM_ID" \
+              CODE_SIGN_STYLE=Manual \
+              PROVISIONING_PROFILE_SPECIFIER="$PROFILE_UUID" \
+              CODE_SIGN_IDENTITY="Apple Distribution" \
+              COMPILER_INDEX_STORE_ENABLE=NO \
+              "${EXTRA_FLAGS[@]}" | xcpretty
+          else
+            xcodebuild \
+              -project "$XCODE_PROJECT" \
+              -scheme "$SCHEME" \
+              -configuration Release \
+              -archivePath "$ARCHIVE_PATH" \
+              -destination "generic/platform=iOS" \
+              archive \
+              DEVELOPMENT_TEAM="$TEAM_ID" \
+              CODE_SIGN_STYLE=Manual \
+              PROVISIONING_PROFILE_SPECIFIER="$PROFILE_UUID" \
+              CODE_SIGN_IDENTITY="Apple Distribution" \
+              COMPILER_INDEX_STORE_ENABLE=NO \
+              "${EXTRA_FLAGS[@]}" | xcpretty
+          fi
 
           echo "Exporting IPA to: $EXPORT_PATH"
           xcodebuild -exportArchive \
             -archivePath "$ARCHIVE_PATH" \
             -exportOptionsPlist exportOptions.plist \
-            -exportPath "$EXPORT_PATH"
+            -exportPath "$EXPORT_PATH" | xcpretty
 
           echo "Export dir listing:"
           ls -lah "$EXPORT_PATH" || true
           test -e "$EXPORT_PATH"/*.ipa
 
-      - name: "Unity | Return license (best-effort)"
-        script: |
-          set -euo pipefail
-          if [ -n "${UNITY_HOME:-}" ]; then
-            UNITY_BIN="$UNITY_HOME/Contents/MacOS/Unity"
-            if [ -x "$UNITY_BIN" ]; then
-              if [ -n "${UNITY_SERIAL:-}" ] || [ -n "${UNITY_LICENSE_FILE:-}" ]; then
-                "$UNITY_BIN" -batchmode -nographics -quit -returnlicense || true
-              else
-                echo "No license to return."
-              fi
-            fi
-          fi
-
     artifacts:
       - $CM_EXPORT_DIR/*.ipa
       - $CM_EXPORT_DIR/*.dSYM.zip
-      - $CM_EXPORT_DIR/*.xcarchive
-      - $CM_BUILD_DIR/unity.log
-      - $CM_BUILD_DIR/licensing/*.alf   # ← чтобы ты забрал ALF при первом прогоне без лицензии
+      - $CM_BUILD_DIR/*.xcarchive
 
     publishing:
       app_store_connect:
