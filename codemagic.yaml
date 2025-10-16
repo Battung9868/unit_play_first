@@ -13,23 +13,23 @@ workflows:
         DEVELOPMENT_TEAM: R35GJ22D76
         SCHEME: Unity-iPhone
         CHOSEN_SCHEME: Unity-iPhone
-        PROFILE_NAME: BrightBins              # точное имя профиля из Dev Portal (НЕ UUID)
+        PROFILE_NAME: BrightBins              # имя профиля (НЕ UUID)
         EXPORT_METHOD: app-store              # корректное значение для App Store
-        # Если проект не в корне репо — укажи путь явно (одну из строк ниже):
+        # Если проект не в корне — укажи путь явно (одну из строк ниже):
         # XCODE_PROJECT: "Build/iOS/Unity-iPhone.xcodeproj"
         # XCODE_WORKSPACE: "MyApp.xcworkspace"
 
     scripts:
       - name: Git LFS (Unity бинарники)
         script: |
-          set -euo pipefail
+          set -eu
           git lfs install
           git lfs fetch
           git lfs checkout
 
       - name: Импорт сертификата и профиля
         script: |
-          set -euo pipefail
+          set -eu
 
           KEYCHAIN_NAME=codemagic.keychain
           KEYCHAIN_PASS="$(uuidgen)"
@@ -44,7 +44,7 @@ workflows:
           if [ -n "${CERTIFICATE_P12:-}" ] && [ -f "${CERTIFICATE_P12:-/dev/null}" ]; then
             CERT_FILE="$CERTIFICATE_P12"
           else
-            echo "$CERTIFICATE_P12" | base64 --decode > "$CERT_FILE"
+            printf "%s" "$CERTIFICATE_P12" | base64 --decode > "$CERT_FILE"
           fi
           security import "$CERT_FILE" -k "$KEYCHAIN_NAME" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security -A
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_NAME"
@@ -56,7 +56,7 @@ workflows:
           if [ -n "${MOBILEPROVISION:-}" ] && [ -f "${MOBILEPROVISION:-/dev/null}" ]; then
             PROF_FILE="$MOBILEPROVISION"
           else
-            echo "$MOBILEPROVISION" | base64 --decode > "$PROF_FILE"
+            printf "%s" "$MOBILEPROVISION" | base64 --decode > "$PROF_FILE"
           fi
 
           PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
@@ -72,25 +72,30 @@ workflows:
           cp "$PROF_FILE" "$PROFILE_DIR/$PROFILE_UUID.mobileprovision"
 
           echo "export PROFILE_UUID=\"$PROFILE_UUID\"" >> "$CM_ENV"
-          echo "export PROFILE_NAME=\"${PROFILE_NAME:-$PROFILE_NAME_DETECTED}\"" >> "$CM_ENV"
+          if [ -n "${PROFILE_NAME:-}" ]; then
+            echo "export PROFILE_NAME=\"$PROFILE_NAME\"" >> "$CM_ENV"
+          else
+            echo "export PROFILE_NAME=\"$PROFILE_NAME_DETECTED\"" >> "$CM_ENV"
+          fi
 
           echo "📄 PROFILE_UUID: $PROFILE_UUID"
           echo "📄 PROFILE_NAME: ${PROFILE_NAME:-$PROFILE_NAME_DETECTED}"
           echo "📄 application-identifier: $APP_IDENTIFIER"
 
-          if [[ "$APP_IDENTIFIER" != *".$BUNDLE_ID" && "$APP_IDENTIFIER" != "$DEVELOPMENT_TEAM.$BUNDLE_ID" ]]; then
-            echo "⚠️ Похоже, профиль не для $BUNDLE_ID. Проверь тип (App Store) и bundle id."
-          fi
+          case "$APP_IDENTIFIER" in
+            *."$BUNDLE_ID"|"$DEVELOPMENT_TEAM.$BUNDLE_ID") : ;;
+            *) echo "⚠️ Похоже, профиль не для $BUNDLE_ID. Проверь тип (App Store) и bundle id." ;;
+          esac
 
-      - name: Найти проект/воркспейс и схему (расширенный поиск)
+      - name: Найти проект/воркспейс и схему (POSIX-поиск)
         script: |
-          set -euo pipefail
+          set -eu
 
           CHOSEN="${SCHEME:-Unity-iPhone}"
           echo "✅ Using scheme (forced): $CHOSEN"
           echo "export CHOSEN_SCHEME=\"$CHOSEN\"" >> "$CM_ENV"
 
-          # Если путь задан вручную — уважаем его
+          # Если путь задан вручную — используем его
           if [ -n "${XCODE_WORKSPACE:-}" ] && [ -d "$XCODE_WORKSPACE" ]; then
             echo "Using workspace (from vars): $XCODE_WORKSPACE"
             echo "export XCODE_WORKSPACE=\"$XCODE_WORKSPACE\"" >> "$CM_ENV"
@@ -105,36 +110,37 @@ workflows:
           ROOT="${CM_REPO_DIR:-$PWD}"
           echo "📁 Repo root: $ROOT"
           echo "🔎 Поиск *.xcworkspace / *.xcodeproj (до 8 уровней)…"
-          mapfile -t WORKSPACES < <(find "$ROOT" -maxdepth 8 -type d -name "*.xcworkspace" -print 2>/dev/null | sort || true)
-          mapfile -t PROJECTS   < <(find "$ROOT" -maxdepth 8 -type d -name "*.xcodeproj"   -print 2>/dev/null | sort || true)
 
-          if [ "${#WORKSPACES[@]}" -gt 0 ]; then
-            XW="${WORKSPACES[0]}"
+          XW="$(find "$ROOT" -maxdepth 8 -type d -name "*.xcworkspace" -print -quit 2>/dev/null || true)"
+          XP=""
+          if [ -z "$XW" ]; then
+            XP="$(find "$ROOT" -maxdepth 8 -type d -name "*.xcodeproj" -print -quit 2>/dev/null || true)"
+          fi
+
+          if [ -n "$XW" ]; then
             echo "✅ Workspace найден: $XW"
             echo "export XCODE_WORKSPACE=\"$XW\"" >> "$CM_ENV"
             exit 0
           fi
-
-          if [ "${#PROJECTS[@]}" -gt 0 ]; then
-            XP="${PROJECTS[0]}"
+          if [ -n "$XP" ]; then
             echo "✅ Project найден: $XP"
             echo "export XCODE_PROJECT=\"$XP\"" >> "$CM_ENV"
             exit 0
           fi
 
           echo "📂 Диагностика содержимого:"
-          command -v tree >/dev/null 2>&1 && tree -L 3 || (ls -la; echo; find . -maxdepth 3 -type d -print)
+          (command -v tree >/dev/null 2>&1 && tree -L 3) || (ls -la; echo; find . -maxdepth 3 -type d -print)
 
           echo "❌ Не найдено ни .xcworkspace, ни .xcodeproj."
-          echo "Подсказываю: добавь XCODE_PROJECT/XCODE_WORKSPACE в vars или закоммить Xcode-проект."
+          echo "Подсказка: добавь XCODE_PROJECT/XCODE_WORKSPACE в vars или закоммить Xcode-проект."
           exit 1
 
       - name: Поднять номер сборки (CFBundleVersion)
         script: |
-          set -euo pipefail
-          INFOPLIST=$(grep -rl --include="Info.plist" "<string>${BUNDLE_ID}</string>" . || true)
+          set -eu
+          INFOPLIST="$(grep -rl --include="Info.plist" "<string>${BUNDLE_ID}</string>" . || true)"
           if [ -z "$INFOPLIST" ]; then
-            INFOPLIST=$(grep -rl --include="Info.plist" "<key>CFBundleIdentifier</key>" . | head -n1 || true)
+            INFOPLIST="$(grep -rl --include="Info.plist" "<key>CFBundleIdentifier</key>" . | head -n1 || true)"
           fi
           if [ -n "$INFOPLIST" ]; then
             /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $CM_BUILD_ID" "$INFOPLIST" 2>/dev/null || \
@@ -146,7 +152,7 @@ workflows:
 
       - name: Archive and export IPA (manual signing)
         script: |
-          set -euo pipefail
+          set -eu
           : "${DEVELOPMENT_TEAM:?Missing DEVELOPMENT_TEAM}"
           : "${BUNDLE_ID:?Missing BUNDLE_ID}"
           : "${EXPORT_METHOD:?Missing EXPORT_METHOD}"
@@ -157,10 +163,10 @@ workflows:
           echo "✅ Archive will use scheme: $CHOSEN_SCHEME"
 
           if [ -n "${XCODE_WORKSPACE:-}" ] && [ -d "$XCODE_WORKSPACE" ]; then
-            PROJ_ARG=(-workspace "$XCODE_WORKSPACE")
+            PROJ_ARG="-workspace \"$XCODE_WORKSPACE\""
             echo "Using workspace: $XCODE_WORKSPACE"
           elif [ -n "${XCODE_PROJECT:-}" ] && [ -d "$XCODE_PROJECT" ]; then
-            PROJ_ARG=(-project "$XCODE_PROJECT")
+            PROJ_ARG="-project \"$XCODE_PROJECT\""
             echo "Using project: $XCODE_PROJECT"
           else
             echo "❌ Ни workspace, ни project не найдены (и не заданы в vars)."
@@ -170,14 +176,14 @@ workflows:
           ARCHIVE_PATH="$CM_BUILD_DIR/app.xcarchive"
 
           # 1) Архивируем без подписи
-          xcodebuild -resolvePackageDependencies "${PROJ_ARG[@]}" -scheme "$CHOSEN_SCHEME"
-          xcodebuild archive \
-            "${PROJ_ARG[@]}" \
-            -scheme "$CHOSEN_SCHEME" \
+          eval xcodebuild -resolvePackageDependencies $PROJ_ARG -scheme \""$CHOSEN_SCHEME"\"
+          eval xcodebuild archive \
+            $PROJ_ARG \
+            -scheme \""$CHOSEN_SCHEME"\" \
             -configuration Release \
-            -archivePath "$ARCHIVE_PATH" \
-            DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" \
-            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            -archivePath \""$ARCHIVE_PATH"\" \
+            DEVELOPMENT_TEAM=\""$DEVELOPMENT_TEAM"\" \
+            PRODUCT_BUNDLE_IDENTIFIER=\""$BUNDLE_ID"\" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
           | tee "$CM_BUILD_DIR/xcodebuild-archive.log"
@@ -214,10 +220,10 @@ workflows:
 
           echo "🧾 exportOptions.plist:"; cat exportOptions.plist
 
-          xcodebuild -exportArchive \
-            -archivePath "$ARCHIVE_PATH" \
+          eval xcodebuild -exportArchive \
+            -archivePath \""$ARCHIVE_PATH"\" \
             -exportOptionsPlist exportOptions.plist \
-            -exportPath "$CM_EXPORT_DIR" \
+            -exportPath \""$CM_EXPORT_DIR"\" \
           | tee "$CM_BUILD_DIR/xcodebuild-export.log"
 
     artifacts:
