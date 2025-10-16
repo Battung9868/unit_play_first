@@ -9,9 +9,9 @@ workflows:
         - appstore_connect   # APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY
       vars:
         BUNDLE_ID: "io.battung.brightbins"
-        EXPORT_METHOD: "app-store"   # "app-store" / "ad-hoc" / "enterprise"
-        # APP_VERSION: "1.1"         # (опц.) маркетинговая версия
-        # APP_BUILD: "123"           # (опц.) номер билда вручную
+        EXPORT_METHOD: "app-store"
+        # APP_VERSION: "1.1"   # опционально
+        # APP_BUILD: "123"     # опционально
 
     scripts:
       - name: "Git LFS (для тяжёлых Unity-бинарников)"
@@ -24,11 +24,9 @@ workflows:
       - name: "Import certificate and provisioning profile"
         script: |
           set -euo pipefail
-
           echo "$CERTIFICATE_P12" | base64 --decode > cert.p12
           echo "$MOBILEPROVISION" | base64 --decode > profile.mobileprovision
 
-          # Кейчейн и сертификат
           keychain initialize
           if [ -n "${CERTIFICATE_PASSWORD:-}" ]; then
             keychain add-certificates --certificate cert.p12 --certificate-password "$CERTIFICATE_PASSWORD"
@@ -36,7 +34,6 @@ workflows:
             keychain add-certificates --certificate cert.p12
           fi
 
-          # Установка профиля и извлечение UUID / TeamID / Name
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
           PROFILE_PLIST="$(security cms -D -i profile.mobileprovision)"
           PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print UUID' /dev/stdin <<< "$PROFILE_PLIST")
@@ -50,7 +47,7 @@ workflows:
             echo "TEAM_ID=$TEAM_ID"
           } >> "$CM_ENV"
 
-          # exportOptions.plist (ВАЖНО: тут нужен ИМЯ профиля, не UUID)
+          # exportOptions.plist: важно — используем ИМЯ профиля
           cat > exportOptions.plist <<EOI
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -120,11 +117,14 @@ workflows:
             exit 66
           fi
 
+          # Сохраним в файл без heredoc/подстановок
+          echo "$SCHEMES" | tr -d '\r' > schemes.txt
+
           # 4) Выбираем схему: Unity-iPhone > любая с WRAPPER_EXTENSION=app > первая
           XCODE_SCHEME=""
-          FIRST_SCHEME="$(printf '%s\n' "$SCHEMES" | head -n1)"
+          FIRST_SCHEME="$(head -n 1 schemes.txt)"
 
-          if printf '%s\n' "$SCHEMES" | grep -qx "Unity-iPhone"; then
+          if grep -qx "Unity-iPhone" schemes.txt; then
             XCODE_SCHEME="Unity-iPhone"
           else
             while IFS= read -r s; do
@@ -138,9 +138,7 @@ workflows:
                   XCODE_SCHEME="$s"; break
                 fi
               fi
-            done <<EOF
-$(printf '%s\n' "$SCHEMES")
-EOF
+            done < schemes.txt
           fi
 
           [ -z "$XCODE_SCHEME" ] && XCODE_SCHEME="$FIRST_SCHEME"
@@ -162,7 +160,7 @@ EOF
           fi
 
           cp "$PBXPROJ" "$PBXPROJ.bak"
-          # Отключаем ВСЕ стадии \"Run Script\" (не трогаем CocoaPods, у них [CP] в name)
+          # Отключаем ВСЕ стадии "Run Script" (не трогаем CocoaPods, у них [CP] в name)
           awk '
             /isa = PBXShellScriptBuildPhase;/ {inblk=1}
             inblk && /name = "Run Script";/ {mark=1}
@@ -188,7 +186,6 @@ EOF
       - name: "Archive and export IPA"
         script: |
           set -euo pipefail
-
           ARCHIVE_PATH="$CM_BUILD_DIR/App.xcarchive"
           EXPORT_PATH="$CM_EXPORT_DIR"
           LOGFILE="$CM_BUILD_DIR/xcodebuild-archive.log"
@@ -199,9 +196,8 @@ EOF
           fi
 
           echo "Archiving… logs → $LOGFILE"
-
+          set +e
           if [ -n "${XCODE_WORKSPACE:-}" ]; then
-            set +e
             xcodebuild \
               -workspace "$XCODE_WORKSPACE" \
               -scheme "$XCODE_SCHEME" \
@@ -216,10 +212,7 @@ EOF
               CODE_SIGN_IDENTITY="Apple Distribution" \
               COMPILER_INDEX_STORE_ENABLE=NO \
               "${EXTRA_FLAGS[@]}" | tee "$LOGFILE"
-            EXIT=${PIPESTATUS[0]}
-            set -e
           else
-            set +e
             xcodebuild \
               -project "$XCODE_PROJECT" \
               -scheme "$XCODE_SCHEME" \
@@ -234,9 +227,9 @@ EOF
               CODE_SIGN_IDENTITY="Apple Distribution" \
               COMPILER_INDEX_STORE_ENABLE=NO \
               "${EXTRA_FLAGS[@]}" | tee "$LOGFILE"
-            EXIT=${PIPESTATUS[0]}
-            set -e
           fi
+          EXIT=${PIPESTATUS[0]}
+          set -e
 
           if [ "$EXIT" -ne 0 ]; then
             echo "==== LAST 300 LINES OF XCODEBUILD LOG ===="
