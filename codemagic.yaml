@@ -1,194 +1,80 @@
-workflows:
-  ios_appstore_manual_signing:
-    name: iOS App Store (Unity Xcode, manual signing)
-    max_build_duration: 60
-
-    environment:
-      groups:
-        - signing
-        - appstore_connect
-      vars:
-        # ⚙️ Подставь свои значения (team/profile/bundle/схема)
-        DEVELOPMENT_TEAM: R35GJ22D76
-        PROFILE_NAME: BrightBins
-        BUNDLE_ID: io.battung.brightbins
-        SCHEME: Unity-iPhone
-        EXPORT_METHOD: app-store
-
-    scripts:
-      - name: Git LFS (Unity бинарники)
-        script: |
-          set -euo pipefail
-          git lfs install
-          git lfs fetch
-          git lfs checkout
-
-      - name: Импорт сертификата и профиля (file | base64 | text)
+      - name: Найти .xcodeproj/.xcworkspace и выбрать схему (надёжно)
         script: |
           set -euo pipefail
 
-          # --- Подготовка файлов из секретов (путь или содержимое) ---
-          ensure_file_from_secret() {
-            local VAR_NAME="$1"        # имя переменной окружения
-            local DEFAULT_NAME="$2"    # имя файла если придется создавать
-            local OUT_PATH              # вернём путь через echo
-
-            local VAL="${!VAR_NAME:-}"
-            if [ -z "$VAL" ]; then
-              echo "❌ Secret $VAR_NAME пустой"; return 1
-            fi
-
-            if [ -f "$VAL" ]; then
-              # Это file-secret: VAL = путь
-              echo "$VAL"
-              return 0
-            fi
-
-            # Это текст/база64 → кладём во временный файл
-            local TMP="$CM_BUILD_DIR/$DEFAULT_NAME"
-            # Пробуем как base64, если не выйдет — запишем как есть
-            if printf "%s" "$VAL" | base64 --decode > "$TMP" 2>/dev/null; then
-              :
-            else
-              printf "%s" "$VAL" > "$TMP"
-            fi
-            echo "$TMP"
-          }
-
-          CERT_FILE="$(ensure_file_from_secret CERTIFICATE_P12 cert.p12)"
-          PROF_FILE="$(ensure_file_from_secret MOBILEPROVISION profile.mobileprovision)"
-
-          # --- Создаём временный keychain и импортируем p12 ---
-          KEYCHAIN_NAME=cm.keychain
-          KEYCHAIN_PASS="$(uuidgen)"
-          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_NAME"
-          security set-keychain-settings "$KEYCHAIN_NAME"
-          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_NAME"
-          security list-keychains -d user -s "$KEYCHAIN_NAME" $(security list-keychains -d user | sed 's/[" ]//g')
-
-          # Важно: не печатаем путь к секретам в логах
-          security import "$CERT_FILE" -k "$KEYCHAIN_NAME" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security -A
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_NAME"
-
-          # --- Кладём provisioning profile в нужную папку ---
-          PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
-          mkdir -p "$PROFILE_DIR"
-          TMP_PLIST="$(mktemp -t prov.plist)"
-          security cms -D -i "$PROF_FILE" > "$TMP_PLIST"
-          UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" "$TMP_PLIST")
-          rm -f "$TMP_PLIST"
-          cp "$PROF_FILE" "$PROFILE_DIR/$UUID.mobileprovision"
-
-      - name: Найти Xcode проект/воркспейс и схему
-        script: |
-          set -euo pipefail
-          WS="$(find . -maxdepth 2 -name '*.xcworkspace' | head -n1 || true)"
-          PR="$(find . -maxdepth 2 -name '*.xcodeproj'     | head -n1 || true)"
+          echo "== Поиск .xcworkspace/.xcodeproj =="
+          WS="$(find . -maxdepth 3 -name '*.xcworkspace' | head -n1 || true)"
+          PR="$(find . -maxdepth 3 -name '*.xcodeproj'     | head -n1 || true)"
 
           if [ -n "$WS" ]; then
+            echo "Using workspace: $WS"
             LIST_ARGS=(-workspace "$WS")
-            echo "export XCODE_WORKSPACE=\"$WS\"" >> $CM_ENV
+            echo "export XCODE_WORKSPACE=\"$WS\"" >> "$CM_ENV"
           elif [ -n "$PR" ]; then
+            echo "Using project: $PR"
             LIST_ARGS=(-project "$PR")
-            echo "export XCODE_PROJECT=\"$PR\"" >> $CM_ENV
+            echo "export XCODE_PROJECT=\"$PR\"" >> "$CM_ENV"
           else
             echo "❌ Не найден .xcworkspace или .xcodeproj"; exit 1
           fi
 
-          if [ -n "${SCHEME:-}" ] && xcodebuild -list "${LIST_ARGS[@]}" | grep -q "$SCHEME"; then
-            CHOSEN_SCHEME="$SCHEME"
-          else
-            CHOSEN_SCHEME="$(xcodebuild -list "${LIST_ARGS[@]}" | sed -n '/Schemes:/,/^$/p' | sed '1d;$d' | head -n1 | xargs || true)"
-          fi
-          [ -n "$CHOSEN_SCHEME" ] || { echo "❌ Не удалось определить схему"; exit 1; }
-
-          echo "Using scheme: $CHOSEN_SCHEME"
-          echo "export CHOSEN_SCHEME=\"$CHOSEN_SCHEME\"" >> $CM_ENV
-
-      - name: Поднять номер сборки (CFBundleVersion)
-        script: |
-          set -euo pipefail
-          # Найдем любой Info.plist в проекте iOS
-          INFOPLIST=$(find . -name Info.plist -path "*/Unity-iPhone*/Info.plist" -o -path "*/UnityFramework*/Info.plist" | head -n1 || true)
-          if [ -n "$INFOPLIST" ]; then
-            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $CM_BUILD_ID" "$INFOPLIST" 2>/dev/null || \
-            /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $CM_BUILD_ID" "$INFOPLIST"
-          fi
-
-      - name: Archive and export IPA
-        script: |
-          set -euo pipefail
-          : "${DEVELOPMENT_TEAM:?Missing DEVELOPMENT_TEAM}"
-          : "${PROFILE_NAME:?Missing PROFILE_NAME}"
-          : "${BUNDLE_ID:?Missing BUNDLE_ID}"
-          : "${EXPORT_METHOD:?Missing EXPORT_METHOD}"
-          : "${CHOSEN_SCHEME:?Missing CHOSEN_SCHEME}"
-
+          echo "== Список схем (JSON) =="
+          # Не все Xcode умеют -json на -workspace, поэтому пробуем по очереди
+          set +e
           if [ -n "${XCODE_WORKSPACE:-}" ]; then
-            PROJ_ARG=(-workspace "$XCODE_WORKSPACE")
+            JSON_LIST="$(xcodebuild -list -json -workspace "$XCODE_WORKSPACE" 2>/dev/null)"
+          fi
+          if [ -z "${JSON_LIST:-}" ] && [ -n "${XCODE_PROJECT:-}" ]; then
+            JSON_LIST="$(xcodebuild -list -json -project "$XCODE_PROJECT" 2>/dev/null)"
+          fi
+          set -e
+
+          if [ -n "${JSON_LIST:-}" ]; then
+            echo "$JSON_LIST" | head -c 2000 || true
+            # Попытаемся достать первую схему через plutil (macOS утилита)
+            set +e
+            FIRST_SCHEME="$(echo "$JSON_LIST" | plutil -extract schemes.0 raw -o - - 2>/dev/null)"
+            set -e
           else
-            PROJ_ARG=(-project "$XCODE_PROJECT")
+            echo "⚠️ -json недоступен; используем текстовый парсер."
+            FIRST_SCHEME="$(xcodebuild -list "${LIST_ARGS[@]}" | sed -n '/Schemes:/,/^$/p' | sed '1d;$d' | head -n1 | xargs || true)"
           fi
 
-          ARCHIVE_PATH="$CM_BUILD_DIR/app.xcarchive"
+          # Если пользователь заранее указал SCHEME и она есть — используем её
+          CHOSEN_SCHEME=""
+          if [ -n "${SCHEME:-}" ]; then
+            echo "Пробуем схему из SCHEME: $SCHEME"
+            if xcodebuild -list "${LIST_ARGS[@]}" | grep -q -F "$SCHEME"; then
+              CHOSEN_SCHEME="$SCHEME"
+            fi
+          fi
 
-          xcodebuild -resolvePackageDependencies "${PROJ_ARG[@]}" -scheme "$CHOSEN_SCHEME"
+          # Иначе берём первую найденную
+          if [ -z "$CHOSEN_SCHEME" ] && [ -n "${FIRST_SCHEME:-}" ]; then
+            CHOSEN_SCHEME="$FIRST_SCHEME"
+          fi
 
-          xcodebuild archive \
-            "${PROJ_ARG[@]}" \
-            -scheme "$CHOSEN_SCHEME" \
-            -configuration Release \
-            -archivePath "$ARCHIVE_PATH" \
-            CODE_SIGN_STYLE=Manual \
-            DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" \
-            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
-            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
-            CODE_SIGN_IDENTITY="Apple Distribution" \
-          | tee "$CM_BUILD_DIR/xcodebuild-archive.log"
+          # Если всё ещё пусто — пробуем дефолт Unity
+          if [ -z "$CHOSEN_SCHEME" ]; then
+            echo "⚠️ Схема не найдена автоматически, пробую 'Unity-iPhone'…"
+            if xcodebuild -list "${LIST_ARGS[@]}" | grep -q -F "Unity-iPhone"; then
+              CHOSEN_SCHEME="Unity-iPhone"
+            fi
+          fi
 
-          mkdir -p "$CM_EXPORT_DIR"
-          cat > exportOptions.plist <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>method</key>
-            <string>${EXPORT_METHOD}</string>
-            <key>teamID</key>
-            <string>${DEVELOPMENT_TEAM}</string>
-            <key>signingStyle</key>
-            <string>manual</string>
-            <key>provisioningProfiles</key>
-            <dict>
-              <key>${BUNDLE_ID}</key>
-              <string>${PROFILE_NAME}</string>
-            </dict>
-            <key>destination</key>
-            <string>export</string>
-            <key>compileBitcode</key>
-            <false/>
-            <key>uploadBitcode</key>
-            <false/>
-          </dict>
-          </plist>
-          EOF
+          if [ -z "$CHOSEN_SCHEME" ]; then
+            echo "❌ Не удалось определить схему."
+            echo "Проверь следующее:"
+            echo "  1) Схема должна быть Shared (в Xcode: Product → Scheme → Manage Schemes… → галочка Shared)."
+            echo "  2) В репозитории должен быть закоммичен файл схемы:"
+            if [ -n "${XCODE_PROJECT:-}" ]; then
+              echo "     ${XCODE_PROJECT}/xcshareddata/xcschemes/<СХЕМА>.xcscheme"
+            else
+              echo "     <Your>.xcodeproj/xcshareddata/xcschemes/<СХЕМА>.xcscheme"
+            fi
+            echo "  3) Если используешь workspace, то схема должна быть в workspace и тоже Shared."
+            exit 1
+          fi
 
-          xcodebuild -exportArchive \
-            -archivePath "$ARCHIVE_PATH" \
-            -exportOptionsPlist exportOptions.plist \
-            -exportPath "$CM_EXPORT_DIR" \
-          | tee "$CM_BUILD_DIR/xcodebuild-export.log"
-
-    artifacts:
-      - $CM_BUILD_DIR/xcodebuild-archive.log
-      - $CM_BUILD_DIR/xcodebuild-export.log
-      - $CM_EXPORT_DIR/*.ipa
-      - $CM_EXPORT_DIR/*.dSYM.zip
-      - $CM_BUILD_DIR/*.xcarchive
-
-    publishing:
-      app_store_connect:
-        api_key: $APP_STORE_CONNECT_PRIVATE_KEY
-        key_id: $APP_STORE_CONNECT_KEY_IDENTIFIER
-        issuer_id: $APP_STORE_CONNECT_ISSUER_ID
-        submit_to_testflight: true
+          echo "✅ Using scheme: $CHOSEN_SCHEME"
+          echo "export CHOSEN_SCHEME=\"$CHOSEN_SCHEME\"" >> "$CM_ENV"
