@@ -1,34 +1,276 @@
 workflows:
-  bootstrap_signing:
-    name: Bootstrap signing (create iOS Distribution p12 once)
-    max_build_duration: 10
+  unity_ios_appstore_manual_signing:
+    name: Unity ➜ iOS ➜ TestFlight (manual signing)
+    max_build_duration: 90
+
     environment:
-      xcode: 16.4
       groups:
+        - signing            # CERTIFICATE_P12, CERTIFICATE_PASSWORD, MOBILEPROVISION
         - appstore_connect   # APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY
+        - unity_credentials  # UNITY_SERIAL (или UNITY_LICENSE_FILE), UNITY_USERNAME, UNITY_PASSWORD — если нужен логин-актив
       vars:
-        CERT_PASSWORD: "Battung"   # после прогонa перенеси в Secrets
+        # ---- Unity / iOS export ----
+        UNITY_VERSION: "2022.3.XXf1"           # ← задай точную версию Unity проекта
+        UNITY_BUILD_DIR: "$CM_BUILD_DIR/Build/iOS"
+        UNITY_LOG: "$CM_BUILD_DIR/unity.log"
+
+        # ---- Xcode targets from Unity export ----
+        XCODE_PROJECT: "$UNITY_BUILD_DIR/Unity-iPhone.xcodeproj"     # fallback если workspace не создан
+        XCODE_WORKSPACE: "$UNITY_BUILD_DIR/Unity-iPhone.xcworkspace" # используется, если присутствует (Pods)
+        XCODE_SCHEME: "Unity-iPhone"
+
+        # ---- App identity ----
+        BUNDLE_ID: "io.battung.brightbins"
+        TEAM_ID: "OVERRIDE_BY_PROFILE"          # будет заменён значением из профиля
+        EXPORT_METHOD: "app-store"
+
+        # ---- Версии (опционально) ----
+        # APP_VERSION: "1.1"                    # маркетинговая версия (CFBundleShortVersionString)
+        # APP_BUILD: "123"                      # build number (CFBundleVersion), иначе авто-timestamp
+
+    cache:
+      cache_paths:
+        - $CM_BUILD_DIR/Library              # Unity Library кэш (ускоряет билд)
+        - $CM_BUILD_DIR/Logs
+        - $CM_BUILD_DIR/Packages
+        - $HOME/Library/Caches/CocoaPods
+        - $HOME/Library/Developer/Xcode/DerivedData
+
     scripts:
-      - name: Generate PKCS#8 private key
+      - name: "Unity | Activate license (if creds provided)"
         script: |
           set -euo pipefail
-          # PKCS#1 -> PKCS#8 (нужен формат с заголовком BEGIN PRIVATE KEY)
-          openssl genrsa -out dist_pkcs1.key 2048
-          openssl pkcs8 -topk8 -in dist_pkcs1.key -nocrypt -out dist.key
+          UNITY="/Applications/Unity/Hub/Editor/$UNITY_VERSION/Unity.app/Contents/MacOS/Unity"
 
-      - name: Create iOS Distribution cert and package into p12
-        script: |
-          set -euo pipefail
-          app-store-connect certificates create \
-            --type IOS_DISTRIBUTION \
-            --certificate-key "$(cat dist.key)" \
-            --p12-password "$CERT_PASSWORD" \
-            --p12-path dist.p12 \
-            --save
+          if [ -x "$UNITY" ]; then
+            echo "Unity found at $UNITY"
+          else
+            echo "::error::Unity $UNITY_VERSION is not installed on this image."
+            echo "Укажи версию, которая реально доступна на образе Codemagic, или переключи стек на нужный."
+            exit 1
+          fi
 
-      - name: Prepare artifact for Secrets (base64)
+          if [ -n "${UNITY_LICENSE_FILE:-}" ]; then
+            echo "Using UNITY_LICENSE_FILE (ulff)."
+            "$UNITY" -batchmode -nographics -quit -manualLicenseFile "$UNITY_LICENSE_FILE" || true
+          elif [ -n "${UNITY_SERIAL:-}" ] && [ -n "${UNITY_USERNAME:-}" ] && [ -n "${UNITY_PASSWORD:-}" ]; then
+            echo "Using username/password + serial activation."
+            "$UNITY" -batchmode -nographics -quit \
+              -serial "$UNITY_SERIAL" \
+              -username "$UNITY_USERNAME" \
+              -password "$UNITY_PASSWORD" || true
+          else
+            echo "No Unity license creds provided; assuming pre-activated image."
+          fi
+
+      - name: "Unity | Ensure CI build script exists"
         script: |
           set -euo pipefail
-          base64 < dist.p12 > dist.p12.b64
+          mkdir -p "Assets/Editor"
+          CI_FILE="Assets/Editor/CI.cs"
+          if [ ! -f "$CI_FILE" ]; then
+            cat > "$CI_FILE" <<'EOF'
+            using System.Linq;
+            using UnityEditor;
+            using UnityEditor.Build.Reporting;
+
+            public static class CI
+            {
+                // Соберёт все включённые в Build Settings сцены ➜ iOS
+                public static void BuildiOS()
+                {
+                    var scenes = EditorBuildSettings.scenes
+                        .Where(s => s.enabled)
+                        .Select(s => s.path)
+                        .ToArray();
+
+                    if (scenes.Length == 0)
+                        throw new System.Exception("No enabled scenes in Build Settings.");
+
+                    var options = new BuildPlayerOptions {
+                        scenes = scenes,
+                        target = BuildTarget.iOS,
+                        locationPathName = System.Environment.GetEnvironmentVariable("UNITY_BUILD_DIR") ?? "Build/iOS",
+                        options = BuildOptions.None
+                    };
+
+                    var report = BuildPipeline.BuildPlayer(options);
+                    if (report.summary.result != BuildResult.Succeeded)
+                        throw new System.Exception($"Unity iOS build failed: {report.summary.result}");
+                }
+            }
+            EOF
+            echo "CI.cs created for headless build."
+          else
+            echo "CI.cs already present. Using existing script."
+          fi
+
+      - name: "Unity | Build iOS Xcode project"
+        script: |
+          set -euo pipefail
+          UNITY="/Applications/Unity/Hub/Editor/$UNITY_VERSION/Unity.app/Contents/MacOS/Unity"
+          mkdir -p "$UNITY_BUILD_DIR"
+          echo "Starting Unity headless build..."
+          "$UNITY" -batchmode -nographics -quit \
+            -projectPath "$CM_BUILD_DIR" \
+            -executeMethod CI.BuildiOS \
+            -logFile "$UNITY_LOG"
+
+          echo "Unity build finished. Tail of log:"
+          tail -n 200 "$UNITY_LOG" || true
+
+          if [ ! -d "$UNITY_BUILD_DIR" ]; then
+            echo "::error::Unity did not produce Xcode project at $UNITY_BUILD_DIR"
+            exit 1
+          fi
+
+      - name: "Import certificate and profile"
+        script: |
+          set -euo pipefail
+
+          echo "$CERTIFICATE_P12" | base64 --decode > cert.p12
+          echo "$MOBILEPROVISION" | base64 --decode > profile.mobileprovision
+
+          # Keychain + certificate
+          keychain initialize
+          if [ -n "${CERTIFICATE_PASSWORD:-}" ]; then
+            keychain add-certificates --certificate cert.p12 --certificate-password "$CERTIFICATE_PASSWORD"
+          else
+            keychain add-certificates --certificate cert.p12
+          fi
+
+          # Install provisioning profile and read UUID + TeamIdentifier
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          PROFILE_PLIST="$(security cms -D -i profile.mobileprovision)"
+          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print UUID' /dev/stdin <<< "$PROFILE_PLIST")
+          PROFILE_TEAM_ID=$(/usr/libexec/PlistBuddy -c 'Print TeamIdentifier:0' /dev/stdin <<< "$PROFILE_PLIST")
+
+          cp profile.mobileprovision "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+          echo "Using Provisioning Profile UUID: $PROFILE_UUID"
+          echo "TeamIdentifier from profile: $PROFILE_TEAM_ID"
+
+          # export to env for next steps
+          echo "PROFILE_UUID=$PROFILE_UUID" >> "$CM_ENV"
+          echo "TEAM_ID=$PROFILE_TEAM_ID"   >> "$CM_ENV"
+
+          # exportOptions.plist
+          cat > exportOptions.plist <<EOI
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>${EXPORT_METHOD}</string>
+            <key>teamID</key><string>${TEAM_ID}</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>provisioningProfiles</key><dict>
+              <key>${BUNDLE_ID}</key><string>${PROFILE_UUID}</string>
+            </dict>
+            <key>stripSwiftSymbols</key><true/>
+            <key>destination</key><string>export</string>
+          </dict></plist>
+          EOI
+          /usr/bin/plutil -lint exportOptions.plist
+
+          # Привязываем профиль к сгенерённому Unity-проекту
+          if [ -d "$XCODE_WORKSPACE" ]; then
+            xcode-project use-profiles --workspace "$XCODE_WORKSPACE" --export-options-plist exportOptions.plist
+          else
+            xcode-project use-profiles --project "$XCODE_PROJECT" --export-options-plist exportOptions.plist
+          fi
+
+      - name: "Fix bundle id in generated Xcode project"
+        script: |
+          set -euo pipefail
+          INFO_PLIST="$UNITY_BUILD_DIR/Info.plist"
+          if [ -f "$INFO_PLIST" ]; then
+            /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$INFO_PLIST" || true
+          fi
+
+          # Подменяем PRODUCT_BUNDLE_IDENTIFIER в project.pbxproj (на случай если Info.plist подтягивается из конфигураций)
+          PBXPROJ="$UNITY_BUILD_DIR/Unity-iPhone.xcodeproj/project.pbxproj"
+          if [ -f "$PBXPROJ" ]; then
+            perl -i -pe "s/PRODUCT_BUNDLE_IDENTIFIER = [^;]+;/PRODUCT_BUNDLE_IDENTIFIER = $BUNDLE_ID;/g" "$PBXPROJ" || true
+          fi
+
+      - name: "Prepare versions (no Info.plist)"
+        script: |
+          set -euo pipefail
+
+          BUILD_NUM="${APP_BUILD:-$(date +%y%j%H%M%S)}"
+          echo "BUILD_NUM=$BUILD_NUM" >> "$CM_ENV"
+
+          if [ -n "${APP_VERSION:-}" ]; then
+            echo "APP_VERSION=$APP_VERSION" >> "$CM_ENV"
+          fi
+
+          echo "== Planned versions =="
+          echo "MARKETING_VERSION=${APP_VERSION:-(unchanged)}"
+          echo "CURRENT_PROJECT_VERSION=$BUILD_NUM"
+
+      - name: "Archive and export IPA (xcodebuild)"
+        script: |
+          set -euo pipefail
+
+          ARCHIVE_PATH="$CM_BUILD_DIR/BrightBins.xcarchive"
+          EXPORT_PATH="$CM_EXPORT_DIR"
+
+          # Определяем, workspace или project
+          XCBUILDTGT=()
+          if [ -d "$XCODE_WORKSPACE" ]; then
+            echo "Using workspace: $XCODE_WORKSPACE"
+            XCBUILDTGT=( -workspace "$XCODE_WORKSPACE" )
+          else
+            echo "Using project: $XCODE_PROJECT"
+            XCBUILDTGT=( -project "$XCODE_PROJECT" )
+          fi
+
+          EXTRA_FLAGS=( CURRENT_PROJECT_VERSION="$BUILD_NUM" PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" )
+          if [ -n "${APP_VERSION:-}" ]; then
+            EXTRA_FLAGS+=( MARKETING_VERSION="$APP_VERSION" )
+          fi
+
+          echo "Archiving to: $ARCHIVE_PATH"
+          xcodebuild \
+            "${XCBUILDTGT[@]}" \
+            -scheme "$XCODE_SCHEME" \
+            -configuration Release \
+            -archivePath "$ARCHIVE_PATH" \
+            archive \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            CODE_SIGN_STYLE=Manual \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_UUID" \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            "${EXTRA_FLAGS[@]}"
+
+          echo "Exporting IPA to: $EXPORT_PATH"
+          xcodebuild -exportArchive \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportOptionsPlist exportOptions.plist \
+            -exportPath "$EXPORT_PATH"
+
+          echo "Export dir listing:"
+          ls -lah "$EXPORT_PATH" || true
+          test -e "$EXPORT_PATH"/*.ipa
+
+      - name: "Unity | Return license (best-effort)"
+        script: |
+          set -euo pipefail
+          UNITY="/Applications/Unity/Hub/Editor/$UNITY_VERSION/Unity.app/Contents/MacOS/Unity"
+          if [ -n "${UNITY_SERIAL:-}" ] || [ -n "${UNITY_LICENSE_FILE:-}" ]; then
+            "$UNITY" -batchmode -nographics -quit -returnlicense || true
+          else
+            echo "No license to return."
+          fi
+
     artifacts:
-      - dist.p12.b64
+      - $CM_EXPORT_DIR/*.ipa
+      - $CM_EXPORT_DIR/*.dSYM.zip
+      - $CM_EXPORT_DIR/*.xcarchive
+      - $CM_BUILD_DIR/unity.log
+
+    publishing:
+      app_store_connect:
+        api_key: $APP_STORE_CONNECT_PRIVATE_KEY
+        key_id: $APP_STORE_CONNECT_KEY_IDENTIFIER
+        issuer_id: $APP_STORE_CONNECT_ISSUER_ID
+        submit_to_testflight: true
