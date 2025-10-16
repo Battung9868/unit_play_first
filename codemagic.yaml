@@ -8,11 +8,11 @@ workflows:
         - signing            # CERTIFICATE_P12, CERTIFICATE_PASSWORD, MOBILEPROVISION
         - appstore_connect   # APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY
       vars:
-        BUNDLE_ID: "io.battung.brightbins"   # твой бандл
-        EXPORT_METHOD: "app-store"           # способ экспорта (testflight/app-store)
+        BUNDLE_ID: "io.battung.brightbins"
+        EXPORT_METHOD: "app-store"
 
     scripts:
-      - name: "Git LFS (обязательно для Unity-бинарников)"
+      - name: "Git LFS (нужно для Unity-бинарников)"
         script: |
           set -euo pipefail
           git lfs install
@@ -26,7 +26,6 @@ workflows:
           echo "$CERTIFICATE_P12" | base64 --decode > cert.p12
           echo "$MOBILEPROVISION" | base64 --decode > profile.mobileprovision
 
-          # Кейчейн и сертификат
           keychain initialize
           if [ -n "${CERTIFICATE_PASSWORD:-}" ]; then
             keychain add-certificates --certificate cert.p12 --certificate-password "$CERTIFICATE_PASSWORD"
@@ -34,7 +33,6 @@ workflows:
             keychain add-certificates --certificate cert.p12
           fi
 
-          # Установка профиля и извлечение UUID/TeamID
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
           PROFILE_PLIST="$(security cms -D -i profile.mobileprovision)"
           PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print UUID' /dev/stdin <<< "$PROFILE_PLIST")
@@ -46,7 +44,6 @@ workflows:
             echo "TEAM_ID=$TEAM_ID"
           } >> "$CM_ENV"
 
-          # exportOptions.plist
           cat > exportOptions.plist <<EOI
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -68,7 +65,7 @@ workflows:
         script: |
           set -euo pipefail
 
-          # Ищем сначала .xcworkspace, если нет — .xcodeproj (глубина любая)
+          # Ищем сначала .xcworkspace, если нет — .xcodeproj (в любой подпапке)
           TARGET_DIR="$(dirname "$(find . -type f -name "*.xcworkspace" -print -quit)")"
           if [ -z "$TARGET_DIR" ] || [ "$TARGET_DIR" = "." ]; then
             TARGET_DIR="$(dirname "$(find . -type f -name "*.xcodeproj" -print -quit)")"
@@ -87,7 +84,7 @@ workflows:
             pod install
           fi
 
-          # Определим workspace/project
+          # Определим workspace или project
           if ls ./*.xcworkspace >/dev/null 2>&1; then
             XCODE_WORKSPACE="$(ls -1 *.xcworkspace | head -n 1)"
             echo "XCODE_WORKSPACE=$XCODE_WORKSPACE" >> "$CM_ENV"
@@ -96,24 +93,19 @@ workflows:
             echo "XCODE_PROJECT=$XCODE_PROJECT" >> "$CM_ENV"
           fi
 
-          # Автовыбор Shared-схемы
+          # Автовыбор Shared-схемы (без heredoc)
           if [ -n "${XCODE_WORKSPACE:-}" ]; then
             SCHEMES_JSON="$(xcodebuild -workspace "$XCODE_WORKSPACE" -list -json 2>/dev/null || true)"
           else
             SCHEMES_JSON="$(xcodebuild -project "$XCODE_PROJECT" -list -json 2>/dev/null || true)"
           fi
-          XCODE_SCHEME="$(/usr/bin/python3 - <<'PY'
-import json,sys
-data=json.loads(sys.stdin.read() or "{}")
-sch = (data.get("workspace",{}) or data.get("project",{})).get("schemes",[])
-print(sch[0] if sch else "")
-PY
-          <<< "$SCHEMES_JSON")"
+          XCODE_SCHEME="$(echo "$SCHEMES_JSON" | /usr/bin/python3 -c 'import sys,json; d=json.load(sys.stdin) if sys.stdin.readable() else {}; w=d.get("workspace") or d.get("project") or {}; s=w.get("schemes") or []; print(s[0] if s else "")')"
           if [ -z "$XCODE_SCHEME" ]; then
             echo "No shared schemes found. Please share a scheme in Xcode." >&2
             exit 66
           fi
           echo "XCODE_SCHEME=$XCODE_SCHEME" >> "$CM_ENV"
+          echo "Detected scheme: $XCODE_SCHEME"
 
       - name: "Prepare versions"
         script: |
