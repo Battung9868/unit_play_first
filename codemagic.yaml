@@ -106,6 +106,49 @@ workflows:
             fi
           fi
 
+          # 3) Получаем список схем (текстовый вывод)
+          if [ -n "${XCODE_WORKSPACE:-}" ]; then
+            LIST_TXT="$(xcodebuild -workspace "$XCODE_WORKSPACE" -list 2>/dev/null || true)"
+          else
+            LIST_TXT="$(xcodebuild -project "$XCODE_PROJECT" -list 2>/dev/null || true)"
+          fi
+
+          SCHEMES="$(printf '%s\n' "$LIST_TXT" | awk '/Schemes:/{flag=1;next} flag && NF {print}' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          if [ -z "$SCHEMES" ]; then
+            echo "❌ No shared schemes found. Enable 'Shared' in Xcode." >&2
+            printf 'xcodebuild -list output:\n%s\n' "$LIST_TXT" >&2
+            exit 66
+          fi
+
+          # Сохраним список схем в файл (без heredoc/подстановок)
+          echo "$SCHEMES" | tr -d '\r' > schemes.txt
+
+          # 4) Выбираем схему: Unity-iPhone > любая с WRAPPER_EXTENSION=app > первая
+          XCODE_SCHEME=""
+          FIRST_SCHEME="$(head -n 1 schemes.txt)"
+
+          if grep -qx "Unity-iPhone" schemes.txt; then
+            XCODE_SCHEME="Unity-iPhone"
+          else
+            while IFS= read -r s; do
+              [ -z "$s" ] && continue
+              if [ -n "${XCODE_WORKSPACE:-}" ]; then
+                if xcodebuild -workspace "$XCODE_WORKSPACE" -scheme "$s" -showBuildSettings 2>/dev/null | grep -q "WRAPPER_EXTENSION = app"; then
+                  XCODE_SCHEME="$s"; break
+                fi
+              else
+                if xcodebuild -project "$XCODE_PROJECT" -scheme "$s" -showBuildSettings 2>/dev/null | grep -q "WRAPPER_EXTENSION = app"; then
+                  XCODE_SCHEME="$s"; break
+                fi
+              fi
+            done < schemes.txt
+          fi
+
+          [ -z "$XCODE_SCHEME" ] && XCODE_SCHEME="$FIRST_SCHEME"
+
+          echo "Detected scheme: $XCODE_SCHEME"
+          echo "XCODE_SCHEME=$XCODE_SCHEME" >> "$CM_ENV"
+
       - name: "Apply manual signing (app target only)"
         script: |
           set -euo pipefail
@@ -116,7 +159,7 @@ workflows:
             PROJ_PATH="$(ls -1 *.xcodeproj | head -n1)"
           fi
           echo "Applying profiles to project: $PROJ_PATH"
-          # Пропишет provisioning только для таргета с ${BUNDLE_ID}, остальным не тронет
+          # Пропишет provisioning только для таргета с ${BUNDLE_ID}, остальные не тронет
           xcode-project use-profiles --project "$PROJ_PATH" --export-options-plist exportOptions.plist
 
       - name: "Patch Unity 'Run Script' phases that break CI"
@@ -166,7 +209,8 @@ workflows:
 
       - name: "Archive and export IPA"
         script: |
-          set -euo pipefail
+          # Важно: БЕЗ -u, чтобы не падать на незаданной XCODE_SCHEME
+          set -eo pipefail
 
           ARCHIVE_PATH="$CM_BUILD_DIR/App.xcarchive"
           EXPORT_PATH="$CM_EXPORT_DIR"
@@ -175,6 +219,43 @@ workflows:
           EXTRA_FLAGS=( CURRENT_PROJECT_VERSION="$BUILD_NUM" )
           if [ -n "${APP_VERSION:-}" ]; then
             EXTRA_FLAGS+=( MARKETING_VERSION="$APP_VERSION" )
+          fi
+
+          # 0) Если внезапно потерялись project/workspace — найдём снова
+          if [ -z "${XCODE_PROJECT:-}" ] && [ -z "${XCODE_WORKSPACE:-}" ]; then
+            TARGET_WS="$(find . -type d -name "*.xcworkspace" -prune -print -quit || true)"
+            TARGET_PR="$(find . -type d -name "*.xcodeproj"   -prune -print -quit || true)"
+            if [ -n "$TARGET_WS" ]; then
+              cd "$(dirname "$TARGET_WS")"
+              XCODE_WORKSPACE="$(basename "$TARGET_WS")"
+              echo "XCODE_WORKSPACE=$XCODE_WORKSPACE" >> "$CM_ENV"
+            elif [ -n "$TARGET_PR" ]; then
+              cd "$(dirname "$TARGET_PR")"
+              XCODE_PROJECT="$(basename "$TARGET_PR")"
+              echo "XCODE_PROJECT=$XCODE_PROJECT" >> "$CM_ENV"
+            else
+              echo "❌ No .xcworkspace or .xcodeproj found even at archive step"; exit 66
+            fi
+          fi
+
+          # 1) Если XCODE_SCHEME не задана — определим сейчас (Unity-iPhone > первая)
+          if [ -z "${XCODE_SCHEME:-}" ]; then
+            if [ -n "${XCODE_WORKSPACE:-}" ]; then
+              LIST_TXT="$(xcodebuild -workspace "$XCODE_WORKSPACE" -list 2>/dev/null || true)"
+            else
+              LIST_TXT="$(xcodebuild -project "$XCODE_PROJECT" -list 2>/dev/null || true)"
+            fi
+            SCHEMES="$(printf '%s\n' "$LIST_TXT" | awk '/Schemes:/{f=1;next} f&&NF{print}' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            if [ -z "$SCHEMES" ]; then
+              echo "❌ No shared schemes found. xcodebuild -list output:"; printf '%s\n' "$LIST_TXT"; exit 66
+            fi
+            if printf '%s\n' "$SCHEMES" | grep -qx "Unity-iPhone"; then
+              XCODE_SCHEME="Unity-iPhone"
+            else
+              XCODE_SCHEME="$(printf '%s\n' "$SCHEMES" | head -n1)"
+            fi
+            echo "Detected scheme (late): $XCODE_SCHEME"
+            echo "XCODE_SCHEME=$XCODE_SCHEME" >> "$CM_ENV"
           fi
 
           echo "Archiving… logs → $LOGFILE"
