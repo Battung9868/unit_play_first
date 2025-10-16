@@ -8,52 +8,90 @@ workflows:
         - signing            # CERTIFICATE_P12, CERTIFICATE_PASSWORD, MOBILEPROVISION
         - appstore_connect   # APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY
       vars:
-        UNITY_VERSION: "2022.3.XXf1"           # ← укажи точную версию
+        # ---- Unity / iOS export ----
+        # (опционально) Зафиксируй версию Unity, если хочешь строго определённую:
+        # UNITY_VERSION: "2022.3.44f1"
         UNITY_BUILD_DIR: "$CM_BUILD_DIR/Build/iOS"
         UNITY_LOG: "$CM_BUILD_DIR/unity.log"
+
+        # ---- Xcode targets из Unity-экспорта ----
         XCODE_PROJECT: "$UNITY_BUILD_DIR/Unity-iPhone.xcodeproj"
         XCODE_WORKSPACE: "$UNITY_BUILD_DIR/Unity-iPhone.xcworkspace"
         XCODE_SCHEME: "Unity-iPhone"
+
+        # ---- App identity ----
         BUNDLE_ID: "io.battung.brightbins"
-        TEAM_ID: "OVERRIDE_BY_PROFILE"
+        TEAM_ID: "OVERRIDE_BY_PROFILE"          # подменится TeamIdentifier из профиля
         EXPORT_METHOD: "app-store"
-        # APP_VERSION: "1.1"
-        # APP_BUILD: "123"
-        
+
+        # ---- Версии (опционально) ----
+        # APP_VERSION: "1.1"                    # CFBundleShortVersionString (маркетинговая)
+        # APP_BUILD: "123"                      # CFBundleVersion; если не задан — timestamp
+
     cache:
       cache_paths:
-        - $CM_BUILD_DIR/Library              # Unity Library кэш (ускоряет билд)
+        - $CM_BUILD_DIR/Library
         - $CM_BUILD_DIR/Logs
         - $CM_BUILD_DIR/Packages
         - $HOME/Library/Caches/CocoaPods
         - $HOME/Library/Developer/Xcode/DerivedData
 
     scripts:
-      - name: "Unity | Activate license (if creds provided)"
+      - name: "Unity | Select & activate editor"
         script: |
           set -euo pipefail
-          UNITY="/Applications/Unity/Hub/Editor/$UNITY_VERSION/Unity.app/Contents/MacOS/Unity"
 
-          if [ -x "$UNITY" ]; then
-            echo "Unity found at $UNITY"
+          UNITY_ROOT="/Applications/Unity/Hub/Editor"
+          if [ -d "$UNITY_ROOT" ]; then
+            echo "Installed Unity editors:"
+            ls -1 "$UNITY_ROOT" || true
           else
-            echo "::error::Unity $UNITY_VERSION is not installed on this image."
-            echo "Укажи версию, которая реально доступна на образе Codemagic, или переключи стек на нужный."
+            echo "::error::Unity Hub editors directory not found at $UNITY_ROOT"
             exit 1
           fi
 
+          # Если задана UNITY_VERSION — пробуем её; иначе возьмём самую свежую по sort -V
+          if [ -n "${UNITY_VERSION:-}" ]; then
+            CANDIDATE="$UNITY_ROOT/$UNITY_VERSION/Unity.app/Contents/MacOS/Unity"
+            if [ -x "$CANDIDATE" ]; then
+              UNITY="$CANDIDATE"
+              echo "Using requested UNITY_VERSION=$UNITY_VERSION"
+            else
+              echo "::warning::Requested UNITY_VERSION=$UNITY_VERSION not found. Falling back to auto-detect."
+            fi
+          fi
+
+          if [ -z "${UNITY:-}" ]; then
+            LATEST_VER="$(ls -1 "$UNITY_ROOT" | sort -V | tail -n1 || true)"
+            if [ -n "$LATEST_VER" ] && [ -x "$UNITY_ROOT/$LATEST_VER/Unity.app/Contents/MacOS/Unity" ]; then
+              UNITY="$UNITY_ROOT/$LATEST_VER/Unity.app/Contents/MacOS/Unity"
+              echo "Auto-selected UNITY_VERSION=$LATEST_VER"
+              echo "UNITY_VERSION=$LATEST_VER" >> "$CM_ENV"
+            else
+              echo "::error::No usable Unity editor found under $UNITY_ROOT"
+              exit 1
+            fi
+          fi
+
+          echo "Unity binary: $UNITY"
+          "$UNITY" -version || true
+
+          # Активация: выполняется только если заданы переменные; иначе считаем образ предактивированным
           if [ -n "${UNITY_LICENSE_FILE:-}" ]; then
-            echo "Using UNITY_LICENSE_FILE (ulff)."
+            echo "Activating via UNITY_LICENSE_FILE..."
             "$UNITY" -batchmode -nographics -quit -manualLicenseFile "$UNITY_LICENSE_FILE" || true
           elif [ -n "${UNITY_SERIAL:-}" ] && [ -n "${UNITY_USERNAME:-}" ] && [ -n "${UNITY_PASSWORD:-}" ]; then
-            echo "Using username/password + serial activation."
+            echo "Activating via serial/username/password..."
             "$UNITY" -batchmode -nographics -quit \
               -serial "$UNITY_SERIAL" \
               -username "$UNITY_USERNAME" \
               -password "$UNITY_PASSWORD" || true
           else
-            echo "No Unity license creds provided; assuming pre-activated image."
+            echo "No Unity license credentials provided; assuming pre-activated image."
           fi
+
+          # Пробросим путь к бинарю UNITY в env для последующих шагов (на тот же ран)
+          echo "UNITY=$UNITY" >> "$CM_ENV"
 
       - name: "Unity | Ensure CI build script exists"
         script: |
@@ -68,7 +106,6 @@ workflows:
 
             public static class CI
             {
-                // Соберёт все включённые в Build Settings сцены ➜ iOS
                 public static void BuildiOS()
                 {
                     var scenes = EditorBuildSettings.scenes
@@ -100,7 +137,11 @@ workflows:
       - name: "Unity | Build iOS Xcode project"
         script: |
           set -euo pipefail
-          UNITY="/Applications/Unity/Hub/Editor/$UNITY_VERSION/Unity.app/Contents/MacOS/Unity"
+          if [ -z "${UNITY:-}" ]; then
+            echo "::error::UNITY binary path is not set. Previous step should export it."
+            exit 1
+          fi
+
           mkdir -p "$UNITY_BUILD_DIR"
           echo "Starting Unity headless build..."
           "$UNITY" -batchmode -nographics -quit \
@@ -162,7 +203,7 @@ workflows:
           EOI
           /usr/bin/plutil -lint exportOptions.plist
 
-          # Привязываем профиль к сгенерённому Unity-проекту
+          # Привязка профиля к Unity-проекту
           if [ -d "$XCODE_WORKSPACE" ]; then
             xcode-project use-profiles --workspace "$XCODE_WORKSPACE" --export-options-plist exportOptions.plist
           else
@@ -176,8 +217,6 @@ workflows:
           if [ -f "$INFO_PLIST" ]; then
             /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$INFO_PLIST" || true
           fi
-
-          # Подменяем PRODUCT_BUNDLE_IDENTIFIER в project.pbxproj (на случай если Info.plist подтягивается из конфигураций)
           PBXPROJ="$UNITY_BUILD_DIR/Unity-iPhone.xcodeproj/project.pbxproj"
           if [ -f "$PBXPROJ" ]; then
             perl -i -pe "s/PRODUCT_BUNDLE_IDENTIFIER = [^;]+;/PRODUCT_BUNDLE_IDENTIFIER = $BUNDLE_ID;/g" "$PBXPROJ" || true
@@ -247,11 +286,12 @@ workflows:
       - name: "Unity | Return license (best-effort)"
         script: |
           set -euo pipefail
-          UNITY="/Applications/Unity/Hub/Editor/$UNITY_VERSION/Unity.app/Contents/MacOS/Unity"
-          if [ -n "${UNITY_SERIAL:-}" ] || [ -n "${UNITY_LICENSE_FILE:-}" ]; then
-            "$UNITY" -batchmode -nographics -quit -returnlicense || true
-          else
-            echo "No license to return."
+          if [ -n "${UNITY:-}" ]; then
+            if [ -n "${UNITY_SERIAL:-}" ] || [ -n "${UNITY_LICENSE_FILE:-}" ]; then
+              "$UNITY" -batchmode -nographics -quit -returnlicense || true
+            else
+              echo "No license to return."
+            fi
           fi
 
     artifacts:
