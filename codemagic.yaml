@@ -12,14 +12,9 @@ workflows:
         BUNDLE_ID: io.battung.brightbins
         DEVELOPMENT_TEAM: R35GJ22D76
         SCHEME: Unity-iPhone
-        CHOSEN_SCHEME: Unity-iPhone
-        PROFILE_NAME: BrightBins              # имя профиля (НЕ UUID)
-        EXPORT_METHOD: app-store
-        XCODE_PROJECT: "Unity-iPhone.xcodeproj"
-        # корректное значение для App Store
-        # Если проект не в корне — укажи путь явно (одну из строк ниже) и Unity-экспорт не понадобится:
-        # XCODE_PROJECT: "Build/iOS/Unity-iPhone.xcodeproj"
-        # XCODE_WORKSPACE: "MyApp.xcworkspace"
+        XCODE_PROJECT: "Unity-iPhone.xcodeproj"    # ← у тебя .xcodeproj в корне
+        PROFILE_NAME: BrightBins                   # точное имя профиля из Dev Portal (НЕ UUID)
+        EXPORT_METHOD: app-store                   # корректное значение для App Store
 
     scripts:
       - name: Git LFS (Unity бинарники)
@@ -32,7 +27,6 @@ workflows:
       - name: Импорт сертификата и профиля
         script: |
           set -eu
-
           KEYCHAIN_NAME=codemagic.keychain
           KEYCHAIN_PASS="$(uuidgen)"
           security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_NAME"
@@ -41,7 +35,7 @@ workflows:
           security list-keychains -d user -s "$KEYCHAIN_NAME"
           security default-keychain -s "$KEYCHAIN_NAME"
 
-          # Сертификат: путь в секрете или base64
+          # Сертификат (путь в секрете или base64)
           CERT_FILE="cert.p12"
           if [ -n "${CERTIFICATE_P12:-}" ] && [ -f "${CERTIFICATE_P12:-/dev/null}" ]; then
             CERT_FILE="$CERTIFICATE_P12"
@@ -50,10 +44,9 @@ workflows:
           fi
           security import "$CERT_FILE" -k "$KEYCHAIN_NAME" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security -A
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_NAME"
-          echo "🔐 Подписи:"
           security find-identity -v -p codesigning "$KEYCHAIN_NAME" || true
 
-          # Профиль: путь в секрете или base64 → ставим в систему
+          # Профиль (путь в секрете или base64) → ставим в систему
           PROF_FILE="profile.mobileprovision"
           if [ -n "${MOBILEPROVISION:-}" ] && [ -f "${MOBILEPROVISION:-/dev/null}" ]; then
             PROF_FILE="$MOBILEPROVISION"
@@ -80,141 +73,18 @@ workflows:
             echo "export PROFILE_NAME=\"$PROFILE_NAME_DETECTED\"" >> "$CM_ENV"
           fi
 
-          echo "📄 PROFILE_UUID: $PROFILE_UUID"
-          echo "📄 PROFILE_NAME: ${PROFILE_NAME:-$PROFILE_NAME_DETECTED}"
-          echo "📄 application-identifier: $APP_IDENTIFIER"
-
           case "$APP_IDENTIFIER" in
             *."$BUNDLE_ID"|"$DEVELOPMENT_TEAM.$BUNDLE_ID") : ;;
-            *) echo "⚠️ Похоже, профиль не для $BUNDLE_ID. Проверь тип (App Store) и bundle id." ;;
+            *) echo "⚠️ Профиль может не соответствовать $BUNDLE_ID (проверь тип: App Store и bundle id).";;
           esac
 
-      - name: Если Xcode-проекта нет — экспортировать его из Unity (headless)
+      - name: Sanity: .xcodeproj exists
         script: |
           set -eu
-
-          # Если явно задан workspace/project — ничего не делаем
-          if [ -n "${XCODE_WORKSPACE:-}" ] || [ -n "${XCODE_PROJECT:-}" ]; then
-            echo "➡️ XCODE_WORKSPACE/PROJECT уже заданы, Unity-экспорт не требуется."
-            exit 0
-          fi
-
-          ROOT="${CM_REPO_DIR:-$PWD}"
-          echo "📁 Repo root: $ROOT"
-
-          # Уже есть .xcworkspace/.xcodeproj в репо?
-          XW="$(find "$ROOT" -maxdepth 8 -type d -name "*.xcworkspace" -print -quit 2>/dev/null || true)"
-          XP="$(find "$ROOT" -maxdepth 8 -type d -name "*.xcodeproj"   -print -quit 2>/dev/null || true)"
-          if [ -n "$XW" ] || [ -n "$XP" ]; then
-            echo "✅ Xcode-проект уже найден в репо, пропускаю Unity-экспорт."
-            exit 0
-          fi
-
-          echo "🧩 Xcode-проект не найден. Запускаю Unity в headless, чтобы экспортировать iOS-проект…"
-
-          # Минимальный Editor-скрипт для сборки iOS
-          mkdir -p "$ROOT/Assets/Editor"
-          cat > "$ROOT/Assets/Editor/CIBuilder.cs" <<'CS'
-          using System.Linq;
-          using System.IO;
-          using UnityEditor;
-          using UnityEditor.Build.Reporting;
-          using UnityEngine;
-
-          public static class CIBuilder {
-              public static void PerformIOSBuild() {
-                  var scenes = EditorBuildSettings.scenes
-                      .Where(s => s.enabled)
-                      .Select(s => s.path)
-                      .ToArray();
-
-                  if (scenes.Length == 0) {
-                      throw new System.Exception("No enabled scenes in Build Settings.");
-                  }
-
-                  var buildPath = Path.Combine("Build", "iOS");
-                  Directory.CreateDirectory(buildPath);
-
-                  var report = BuildPipeline.BuildPlayer(scenes, buildPath, BuildTarget.iOS, BuildOptions.None);
-                  if (report.summary.result != BuildResult.Succeeded) {
-                      throw new System.Exception("iOS build failed: " + report.summary.result);
-                  }
-                  Debug.Log("✅ Unity exported iOS project to: " + buildPath);
-              }
-          }
-          CS
-
-          # Ищем Unity бинарник
-          UNITY_BIN="$(ls -d /Applications/Unity/Hub/Editor/*/Unity.app/Contents/MacOS/Unity 2>/dev/null | sort -V | tail -n 1 || true)"
-          if [ -z "$UNITY_BIN" ]; then
-            # запасной путь
-            UNITY_BIN="/Applications/Unity/Unity.app/Contents/MacOS/Unity"
-          fi
-          if [ ! -x "$UNITY_BIN" ]; then
-            echo "❌ Unity не найден. Укажи XCODE_PROJECT вручную или установи Unity на образе."
-            exit 1
-          fi
-          echo "🟢 Использую Unity: $UNITY_BIN"
-
-          "$UNITY_BIN" -quit -batchmode -nographics \
-            -projectPath "$ROOT" \
-            -executeMethod CIBuilder.PerformIOSBuild \
-            -logFile "$CM_BUILD_DIR/unity-export.log"
-
-          # Проверяем, что Xcode-проект появился
-          XP2="$(find "$ROOT/Build/iOS" -maxdepth 1 -type d -name "*.xcodeproj" -print -quit 2>/dev/null || true)"
-          if [ -z "$XP2" ]; then
-            echo "❌ Unity не создал .xcodeproj в Build/iOS. Смотри лог: $CM_BUILD_DIR/unity-export.log"
-            exit 1
-          fi
-
-          echo "✅ Найден Xcode-проект: $XP2"
-          echo "export XCODE_PROJECT=\"$XP2\"" >> "$CM_ENV"
-
-      - name: Найти проект/воркспейс и схему (POSIX-поиск)
-        script: |
-          set -eu
-
-          CHOSEN="${SCHEME:-Unity-iPhone}"
-          echo "✅ Using scheme (forced): $CHOSEN"
-          echo "export CHOSEN_SCHEME=\"$CHOSEN\"" >> "$CM_ENV"
-
-          # Если путь задан вручную/получен из Unity — уважаем его
-          if [ -n "${XCODE_WORKSPACE:-}" ] && [ -d "$XCODE_WORKSPACE" ]; then
-            echo "Using workspace (predefined): $XCODE_WORKSPACE"
-            echo "export XCODE_WORKSPACE=\"$XCODE_WORKSPACE\"" >> "$CM_ENV"
-            exit 0
-          fi
-          if [ -n "${XCODE_PROJECT:-}" ] && [ -d "$XCODE_PROJECT" ]; then
-            echo "Using project (predefined): $XCODE_PROJECT"
-            echo "export XCODE_PROJECT=\"$XCODE_PROJECT\"" >> "$CM_ENV"
-            exit 0
-          fi
-
-          ROOT="${CM_REPO_DIR:-$PWD}"
-          echo "📁 Repo root: $ROOT"
-          echo "🔎 Поиск *.xcworkspace / *.xcodeproj (до 8 уровней)…"
-
-          XW="$(find "$ROOT" -maxdepth 8 -type d -name "*.xcworkspace" -print -quit 2>/dev/null || true)"
-          XP="$(find "$ROOT" -maxdepth 8 -type d -name "*.xcodeproj"   -print -quit 2>/dev/null || true)"
-
-          if [ -n "$XW" ]; then
-            echo "✅ Workspace найден: $XW"
-            echo "export XCODE_WORKSPACE=\"$XW\"" >> "$CM_ENV"
-            exit 0
-          fi
-          if [ -n "$XP" ]; then
-            echo "✅ Project найден: $XP"
-            echo "export XCODE_PROJECT=\"$XP\"" >> "$CM_ENV"
-            exit 0
-          fi
-
-          echo "📂 Диагностика содержимого:"
-          (command -v tree >/dev/null 2>&1 && tree -L 3) || (ls -la; echo; find . -maxdepth 3 -type d -print)
-
-          echo "❌ Не найдено ни .xcworkspace, ни .xcodeproj."
-          echo "Подсказка: добавь XCODE_PROJECT/XCODE_WORKSPACE в vars или закоммить Xcode-проект."
-          exit 1
+          echo "PWD=$(pwd)"
+          ls -la
+          test -d "$XCODE_PROJECT" || { echo "❌ Не найден проект: $XCODE_PROJECT"; exit 1; }
+          echo "✅ Найден проект: $XCODE_PROJECT"
 
       - name: Поднять номер сборки (CFBundleVersion)
         script: |
@@ -238,28 +108,19 @@ workflows:
           : "${BUNDLE_ID:?Missing BUNDLE_ID}"
           : "${EXPORT_METHOD:?Missing EXPORT_METHOD}"
           : "${PROFILE_NAME:?Missing PROFILE_NAME}"
+          : "${XCODE_PROJECT:?Missing XCODE_PROJECT}"
 
-          CHOSEN_SCHEME="${CHOSEN_SCHEME:-${SCHEME:-Unity-iPhone}}"
-          [ -z "$CHOSEN_SCHEME" ] && { echo "❌ Нет схемы"; exit 1; }
+          CHOSEN_SCHEME="${SCHEME:-Unity-iPhone}"
           echo "✅ Archive will use scheme: $CHOSEN_SCHEME"
 
-          if [ -n "${XCODE_WORKSPACE:-}" ] && [ -d "$XCODE_WORKSPACE" ]; then
-            PROJ_ARG="-workspace \"$XCODE_WORKSPACE\""
-            echo "Using workspace: $XCODE_WORKSPACE"
-          elif [ -n "${XCODE_PROJECT:-}" ] && [ -d "$XCODE_PROJECT" ]; then
-            PROJ_ARG="-project \"$XCODE_PROJECT\""
-            echo "Using project: $XCODE_PROJECT"
-          else
-            echo "❌ Ни workspace, ни project не найдены (и не заданы в vars)."
-            exit 1
-          fi
-
           ARCHIVE_PATH="$CM_BUILD_DIR/app.xcarchive"
+          CM_EXPORT_DIR="${CM_EXPORT_DIR:-$CM_BUILD_DIR/Export}"
+          mkdir -p "$CM_EXPORT_DIR"
 
-          # 1) Архивируем без подписи
-          eval xcodebuild -resolvePackageDependencies $PROJ_ARG -scheme \""$CHOSEN_SCHEME"\"
+          # 1) Архивируем без подписи (чтобы UnityFramework не конфликтовал)
+          eval xcodebuild -resolvePackageDependencies -project \""$XCODE_PROJECT"\" -scheme \""$CHOSEN_SCHEME"\"
           eval xcodebuild archive \
-            $PROJ_ARG \
+            -project \""$XCODE_PROJECT"\" \
             -scheme \""$CHOSEN_SCHEME"\" \
             -configuration Release \
             -archivePath \""$ARCHIVE_PATH"\" \
@@ -270,7 +131,6 @@ workflows:
           | tee "$CM_BUILD_DIR/xcodebuild-archive.log"
 
           # 2) Экспорт с ручным подписанием
-          mkdir -p "$CM_EXPORT_DIR"
           cat > exportOptions.plist <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -301,14 +161,28 @@ workflows:
 
           echo "🧾 exportOptions.plist:"; cat exportOptions.plist
 
+          set +e
           eval xcodebuild -exportArchive \
             -archivePath \""$ARCHIVE_PATH"\" \
             -exportOptionsPlist exportOptions.plist \
             -exportPath \""$CM_EXPORT_DIR"\" \
           | tee "$CM_BUILD_DIR/xcodebuild-export.log"
+          XCB_RET=$?
+          set -e
+
+          echo "📂 Export dir: $CM_EXPORT_DIR"
+          find "$CM_EXPORT_DIR" -maxdepth 2 -type f -print || true
+
+          IPA_PATH="$(find "$CM_EXPORT_DIR" -name '*.ipa' -print -quit || true)"
+          if [ $XCB_RET -ne 0 ] || [ -z "$IPA_PATH" ]; then
+            echo "❌ IPA не создана. Лог экспорта (хвост):"
+            tail -n 200 "$CM_BUILD_DIR/xcodebuild-export.log" || true
+            exit 1
+          fi
+
+          echo "✅ IPA создана: $IPA_PATH"
 
     artifacts:
-      - $CM_BUILD_DIR/unity-export.log
       - $CM_BUILD_DIR/xcodebuild-archive.log
       - $CM_BUILD_DIR/xcodebuild-export.log
       - $CM_EXPORT_DIR/*.ipa
@@ -320,5 +194,9 @@ workflows:
         api_key: $APP_STORE_CONNECT_PRIVATE_KEY
         key_id: $APP_STORE_CONNECT_KEY_IDENTIFIER
         issuer_id: $APP_STORE_CONNECT_ISSUER_ID
+
         submit_to_testflight: true
-        # skip_waiting_for_build_processing: true
+        submit_to_app_store: true            # отправит на App Store Review
+        cancel_previous_submissions: true    # опционально
+        release_type: MANUAL                 # MANUAL | AFTER_APPROVAL | SCHEDULED
+        # earliest_release_date: 2025-10-20T10:00:00+00:00
