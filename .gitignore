@@ -33,3 +33,8 @@ Carthage/Build/
 # === Temp files ===
 *.tmp
 *.swp
+!Il2CppOutputProject/
+!Il2CppOutputProject/IL2CPP/
+!Il2CppOutputProject/IL2CPP/build/
+!Il2CppOutputProject/IL2CPP/build/**
+
