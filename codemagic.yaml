@@ -4,29 +4,23 @@ workflows:
     max_build_duration: 90
 
     environment:
+      unity: "2022.3.62f2"   # ← поставь версию из ProjectSettings/ProjectVersion.txt, если другая
       groups:
         - signing            # CERTIFICATE_P12, CERTIFICATE_PASSWORD, MOBILEPROVISION
         - appstore_connect   # APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY
       vars:
-        # ---- Unity / iOS export ----
-        # (опционально) Зафиксируй версию Unity, если хочешь строго определённую:
-        # UNITY_VERSION: "2022.3.44f1"
         UNITY_BUILD_DIR: "$CM_BUILD_DIR/Build/iOS"
         UNITY_LOG: "$CM_BUILD_DIR/unity.log"
 
-        # ---- Xcode targets из Unity-экспорта ----
         XCODE_PROJECT: "$UNITY_BUILD_DIR/Unity-iPhone.xcodeproj"
         XCODE_WORKSPACE: "$UNITY_BUILD_DIR/Unity-iPhone.xcworkspace"
         XCODE_SCHEME: "Unity-iPhone"
 
-        # ---- App identity ----
         BUNDLE_ID: "io.battung.brightbins"
-        TEAM_ID: "OVERRIDE_BY_PROFILE"          # подменится TeamIdentifier из профиля
+        TEAM_ID: "OVERRIDE_BY_PROFILE"
         EXPORT_METHOD: "app-store"
-
-        # ---- Версии (опционально) ----
-        # APP_VERSION: "1.1"                    # CFBundleShortVersionString (маркетинговая)
-        # APP_BUILD: "123"                      # CFBundleVersion; если не задан — timestamp
+        # APP_VERSION: "1.1"
+        # APP_BUILD: "123"
 
     cache:
       cache_paths:
@@ -37,61 +31,35 @@ workflows:
         - $HOME/Library/Developer/Xcode/DerivedData
 
     scripts:
-      - name: "Unity | Select & activate editor"
+      - name: "Unity | Print chosen editor & (optional) activate license"
         script: |
           set -euo pipefail
-
-          UNITY_ROOT="/Applications/Unity/Hub/Editor"
-          if [ -d "$UNITY_ROOT" ]; then
-            echo "Installed Unity editors:"
-            ls -1 "$UNITY_ROOT" || true
-          else
-            echo "::error::Unity Hub editors directory not found at $UNITY_ROOT"
+          # Codemagic сам ставит Unity и задаёт UNITY_HOME по ключу environment.unity
+          if [ -z "${UNITY_HOME:-}" ]; then
+            echo "::error::UNITY_HOME is not set. The 'environment.unity' key should auto-install Unity before scripts."
             exit 1
           fi
-
-          # Если задана UNITY_VERSION — пробуем её; иначе возьмём самую свежую по sort -V
-          if [ -n "${UNITY_VERSION:-}" ]; then
-            CANDIDATE="$UNITY_ROOT/$UNITY_VERSION/Unity.app/Contents/MacOS/Unity"
-            if [ -x "$CANDIDATE" ]; then
-              UNITY="$CANDIDATE"
-              echo "Using requested UNITY_VERSION=$UNITY_VERSION"
-            else
-              echo "::warning::Requested UNITY_VERSION=$UNITY_VERSION not found. Falling back to auto-detect."
-            fi
+          UNITY_BIN="$UNITY_HOME/Contents/MacOS/Unity"
+          if [ ! -x "$UNITY_BIN" ]; then
+            echo "::error::Unity binary not found at $UNITY_BIN"
+            exit 1
           fi
+          echo "Using UNITY_HOME: $UNITY_HOME"
+          "$UNITY_BIN" -version || true
 
-          if [ -z "${UNITY:-}" ]; then
-            LATEST_VER="$(ls -1 "$UNITY_ROOT" | sort -V | tail -n1 || true)"
-            if [ -n "$LATEST_VER" ] && [ -x "$UNITY_ROOT/$LATEST_VER/Unity.app/Contents/MacOS/Unity" ]; then
-              UNITY="$UNITY_ROOT/$LATEST_VER/Unity.app/Contents/MacOS/Unity"
-              echo "Auto-selected UNITY_VERSION=$LATEST_VER"
-              echo "UNITY_VERSION=$LATEST_VER" >> "$CM_ENV"
-            else
-              echo "::error::No usable Unity editor found under $UNITY_ROOT"
-              exit 1
-            fi
-          fi
-
-          echo "Unity binary: $UNITY"
-          "$UNITY" -version || true
-
-          # Активация: выполняется только если заданы переменные; иначе считаем образ предактивированным
+          # Активация лицензии — только если заданы креды; иначе пропустим (часто не требуется для экспорта)
           if [ -n "${UNITY_LICENSE_FILE:-}" ]; then
             echo "Activating via UNITY_LICENSE_FILE..."
-            "$UNITY" -batchmode -nographics -quit -manualLicenseFile "$UNITY_LICENSE_FILE" || true
+            "$UNITY_BIN" -batchmode -nographics -quit -manualLicenseFile "$UNITY_LICENSE_FILE" || true
           elif [ -n "${UNITY_SERIAL:-}" ] && [ -n "${UNITY_USERNAME:-}" ] && [ -n "${UNITY_PASSWORD:-}" ]; then
             echo "Activating via serial/username/password..."
-            "$UNITY" -batchmode -nographics -quit \
+            "$UNITY_BIN" -batchmode -nographics -quit \
               -serial "$UNITY_SERIAL" \
               -username "$UNITY_USERNAME" \
               -password "$UNITY_PASSWORD" || true
           else
-            echo "No Unity license credentials provided; assuming pre-activated image."
+            echo "No Unity license credentials provided; continuing without explicit activation."
           fi
-
-          # Пробросим путь к бинарю UNITY в env для последующих шагов (на тот же ран)
-          echo "UNITY=$UNITY" >> "$CM_ENV"
 
       - name: "Unity | Ensure CI build script exists"
         script: |
@@ -137,14 +105,10 @@ workflows:
       - name: "Unity | Build iOS Xcode project"
         script: |
           set -euo pipefail
-          if [ -z "${UNITY:-}" ]; then
-            echo "::error::UNITY binary path is not set. Previous step should export it."
-            exit 1
-          fi
-
+          UNITY_BIN="$UNITY_HOME/Contents/MacOS/Unity"
           mkdir -p "$UNITY_BUILD_DIR"
           echo "Starting Unity headless build..."
-          "$UNITY" -batchmode -nographics -quit \
+          "$UNITY_BIN" -batchmode -nographics -quit \
             -projectPath "$CM_BUILD_DIR" \
             -executeMethod CI.BuildiOS \
             -logFile "$UNITY_LOG"
@@ -164,7 +128,6 @@ workflows:
           echo "$CERTIFICATE_P12" | base64 --decode > cert.p12
           echo "$MOBILEPROVISION" | base64 --decode > profile.mobileprovision
 
-          # Keychain + certificate
           keychain initialize
           if [ -n "${CERTIFICATE_PASSWORD:-}" ]; then
             keychain add-certificates --certificate cert.p12 --certificate-password "$CERTIFICATE_PASSWORD"
@@ -172,7 +135,6 @@ workflows:
             keychain add-certificates --certificate cert.p12
           fi
 
-          # Install provisioning profile and read UUID + TeamIdentifier
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
           PROFILE_PLIST="$(security cms -D -i profile.mobileprovision)"
           PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print UUID' /dev/stdin <<< "$PROFILE_PLIST")
@@ -182,11 +144,9 @@ workflows:
           echo "Using Provisioning Profile UUID: $PROFILE_UUID"
           echo "TeamIdentifier from profile: $PROFILE_TEAM_ID"
 
-          # export to env for next steps
           echo "PROFILE_UUID=$PROFILE_UUID" >> "$CM_ENV"
           echo "TEAM_ID=$PROFILE_TEAM_ID"   >> "$CM_ENV"
 
-          # exportOptions.plist
           cat > exportOptions.plist <<EOI
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -203,7 +163,6 @@ workflows:
           EOI
           /usr/bin/plutil -lint exportOptions.plist
 
-          # Привязка профиля к Unity-проекту
           if [ -d "$XCODE_WORKSPACE" ]; then
             xcode-project use-profiles --workspace "$XCODE_WORKSPACE" --export-options-plist exportOptions.plist
           else
@@ -225,14 +184,11 @@ workflows:
       - name: "Prepare versions (no Info.plist)"
         script: |
           set -euo pipefail
-
           BUILD_NUM="${APP_BUILD:-$(date +%y%j%H%M%S)}"
           echo "BUILD_NUM=$BUILD_NUM" >> "$CM_ENV"
-
           if [ -n "${APP_VERSION:-}" ]; then
             echo "APP_VERSION=$APP_VERSION" >> "$CM_ENV"
           fi
-
           echo "== Planned versions =="
           echo "MARKETING_VERSION=${APP_VERSION:-(unchanged)}"
           echo "CURRENT_PROJECT_VERSION=$BUILD_NUM"
@@ -240,11 +196,9 @@ workflows:
       - name: "Archive and export IPA (xcodebuild)"
         script: |
           set -euo pipefail
-
           ARCHIVE_PATH="$CM_BUILD_DIR/BrightBins.xcarchive"
           EXPORT_PATH="$CM_EXPORT_DIR"
 
-          # Определяем, workspace или project
           XCBUILDTGT=()
           if [ -d "$XCODE_WORKSPACE" ]; then
             echo "Using workspace: $XCODE_WORKSPACE"
@@ -286,9 +240,10 @@ workflows:
       - name: "Unity | Return license (best-effort)"
         script: |
           set -euo pipefail
-          if [ -n "${UNITY:-}" ]; then
+          UNITY_BIN="$UNITY_HOME/Contents/MacOS/Unity"
+          if [ -x "$UNITY_BIN" ]; then
             if [ -n "${UNITY_SERIAL:-}" ] || [ -n "${UNITY_LICENSE_FILE:-}" ]; then
-              "$UNITY" -batchmode -nographics -quit -returnlicense || true
+              "$UNITY_BIN" -batchmode -nographics -quit -returnlicense || true
             else
               echo "No license to return."
             fi
