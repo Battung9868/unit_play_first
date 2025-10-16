@@ -2,7 +2,7 @@ workflows:
   ios_appstore_manual_signing:
     name: iOS App Store (Unity Xcode, manual signing)
     max_build_duration: 60
-    # instance_type: mac_mini_m2   # при необходимости можно включить конкретный образ
+    # instance_type: mac_mini_m2   # опционально: закрепить тип машины/образ Xcode
 
     environment:
       groups:
@@ -12,7 +12,7 @@ workflows:
         # === ПОДСТАВЬ СВОЁ ПРИ НУЖДЕ ===
         BUNDLE_ID: io.battung.brightbins
         SCHEME: Unity-iPhone
-        CHOSEN_SCHEME: Unity-iPhone   # ← фолбэк, если шаг выбора схемы не проставит переменную
+        CHOSEN_SCHEME: Unity-iPhone   # фолбэк, если шаг выбора схемы не проставит переменную
         DEVELOPMENT_TEAM: R35GJ22D76
         PROFILE_NAME: BrightBins
         EXPORT_METHOD: app-store
@@ -38,14 +38,14 @@ workflows:
 
           # --- Поддержка и secure-файлов, и base64-переменных ---
           CERT_FILE="cert.p12"
-          if [ -f "${CERTIFICATE_P12:-}" ]; then
+          if [ -n "${CERTIFICATE_P12:-}" ] && [ -f "${CERTIFICATE_P12:-/dev/null}" ]; then
             CERT_FILE="$CERTIFICATE_P12"
           else
             echo "$CERTIFICATE_P12" | base64 --decode > "$CERT_FILE"
           fi
 
           PROF_FILE="profile.mobileprovision"
-          if [ -f "${MOBILEPROVISION:-}" ]; then
+          if [ -n "${MOBILEPROVISION:-}" ] && [ -f "${MOBILEPROVISION:-/dev/null}" ]; then
             PROF_FILE="$MOBILEPROVISION"
           else
             echo "$MOBILEPROVISION" | base64 --decode > "$PROF_FILE"
@@ -103,7 +103,7 @@ workflows:
             set -e
           else
             echo "⚠️ -json недоступен; используем текстовый парсер."
-            FIRST_SCHEME="$(xcodebuild -list "${LIST_ARGS[@]}" | sed -n '/Schemes:/,/^$/p' | sed '1d;$d' | head -n1 | xargs || true)"
+            FIRST_SCHEME="$(xcodebuild -list "${LIST_ARGS[@]}" | sed -n '/Schemes:/,/^$/p' | sed -n '2p' | xargs || true)"
           fi
 
           # Приоритет: SCHEME (если существует) → первая найденная → Unity-iPhone
@@ -171,18 +171,33 @@ workflows:
           : "${BUNDLE_ID:?Missing BUNDLE_ID}"
           : "${EXPORT_METHOD:?Missing EXPORT_METHOD}"
 
-          # Мягкий фолбэк схемы (не падаем из-за пустой переменной)
+          # Мягкий фолбэк схемы
           CHOSEN_SCHEME="${CHOSEN_SCHEME:-${SCHEME:-Unity-iPhone}}"
           if [ -z "$CHOSEN_SCHEME" ]; then
             echo "❌ Нет схемы (CHOSEN_SCHEME/SCHEME пусты)"; exit 1
           fi
           echo "✅ Archive will use scheme: $CHOSEN_SCHEME"
 
-          # Определяем, что использовать: workspace или project
+          # Надёжно определим workspace/project без "unbound variable"
           if [ -n "${XCODE_WORKSPACE:-}" ]; then
+            echo "Using workspace: $XCODE_WORKSPACE"
             PROJ_ARG=(-workspace "$XCODE_WORKSPACE")
-          else
+          elif [ -n "${XCODE_PROJECT:-}" ]; then
+            echo "Using project: $XCODE_PROJECT"
             PROJ_ARG=(-project "$XCODE_PROJECT")
+          else
+            echo "⚠️ XCODE_WORKSPACE/XCODE_PROJECT не выставлены — пытаюсь определить здесь."
+            WS="$(find . -maxdepth 3 -name '*.xcworkspace' | head -n1 || true)"
+            PR="$(find . -maxdepth 3 -name '*.xcodeproj'     | head -n1 || true)"
+            if [ -n "$WS" ]; then
+              echo "Using workspace (re-detected): $WS"
+              PROJ_ARG=(-workspace "$WS")
+            elif [ -n "$PR" ]; then
+              echo "Using project (re-detected): $PR"
+              PROJ_ARG=(-project "$PR")
+            else
+              echo "❌ Не найден .xcworkspace или .xcodeproj"; exit 1
+            fi
           fi
 
           ARCHIVE_PATH="$CM_BUILD_DIR/app.xcarchive"
