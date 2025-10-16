@@ -9,9 +9,9 @@ workflows:
         - appstore_connect   # APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY
       vars:
         BUNDLE_ID: "io.battung.brightbins"
-        EXPORT_METHOD: "app-store"   # "app-store" / "ad-hoc" / "enterprise"
-        # APP_VERSION: "1.1"         # (опц.) маркетинговая версия
-        # APP_BUILD: "123"           # (опц.) номер билда вручную
+        EXPORT_METHOD: "app-store"
+        # APP_VERSION: "1.1"     # (опц.) маркетинговая версия
+        # APP_BUILD: "123"       # (опц.) номер билда вручную
 
     scripts:
       - name: "Git LFS (для тяжёлых Unity-бинарников)"
@@ -28,7 +28,6 @@ workflows:
           echo "$CERTIFICATE_P12" | base64 --decode > cert.p12
           echo "$MOBILEPROVISION" | base64 --decode > profile.mobileprovision
 
-          # Кейчейн и сертификат
           keychain initialize
           if [ -n "${CERTIFICATE_PASSWORD:-}" ]; then
             keychain add-certificates --certificate cert.p12 --certificate-password "$CERTIFICATE_PASSWORD"
@@ -36,7 +35,6 @@ workflows:
             keychain add-certificates --certificate cert.p12
           fi
 
-          # Установка профиля и извлечение UUID/TeamID
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
           PROFILE_PLIST="$(security cms -D -i profile.mobileprovision)"
           PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print UUID' /dev/stdin <<< "$PROFILE_PLIST")
@@ -48,7 +46,7 @@ workflows:
             echo "TEAM_ID=$TEAM_ID"
           } >> "$CM_ENV"
 
-          # exportOptions.plist для экспорта IPA
+          # exportOptions.plist
           cat > exportOptions.plist <<EOI
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -70,7 +68,7 @@ workflows:
         script: |
           set -euo pipefail
 
-          # 1) Ищем сначала .xcworkspace (директория), если нет — .xcodeproj (директория), в ЛЮБОЙ подпапке
+          # 1) ищем .xcworkspace (директория), иначе .xcodeproj (директория)
           TARGET_WS="$(find . -type d -name "*.xcworkspace" -prune -print -quit || true)"
           TARGET_PR="$(find . -type d -name "*.xcodeproj"   -prune -print -quit || true)"
 
@@ -87,13 +85,12 @@ workflows:
             echo "Using project: $XCODE_PROJECT (dir: $TARGET_DIR)"
             echo "XCODE_PROJECT=$XCODE_PROJECT" >> "$CM_ENV"
           else
-            echo "❌ No .xcworkspace or .xcodeproj found in repo" >&2
-            echo "Repo tree (depth 3) for debug:"
+            echo "❌ No .xcworkspace or .xcodeproj found. Repo tree:" >&2
             find . -maxdepth 3 -print | sed -n '1,300p'
             exit 66
           fi
 
-          # 2) CocoaPods (если есть Podfile — ставим Pods; может создать workspace)
+          # 2) CocoaPods при наличии Podfile
           if [ -f "Podfile" ]; then
             gem install cocoapods --no-document
             pod repo update
@@ -105,25 +102,89 @@ workflows:
             fi
           fi
 
-          # 3) Получаем список схем из текстового вывода (без JSON)
+          # 3) соберём список схем (текстовый вывод)
           if [ -n "${XCODE_WORKSPACE:-}" ]; then
             LIST_TXT="$(xcodebuild -workspace "$XCODE_WORKSPACE" -list 2>/dev/null || true)"
           else
             LIST_TXT="$(xcodebuild -project "$XCODE_PROJECT" -list 2>/dev/null || true)"
           fi
+          printf '%s\n' "$LIST_TXT" > /tmp/xclist.txt || true
 
-          # Берём первую непустую строку после "Schemes:"
-          XCODE_SCHEME="$(printf '%s\n' "$LIST_TXT" | awk '/Schemes:/{flag=1;next} flag && NF {print; exit}' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          # все схемы построчно
+          mapfile -t ALL_SCHEMES < <(awk '/Schemes:/{flag=1;next} flag && NF {print}' /tmp/xclist.txt | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+          # 4) приоритет выбора схемы:
+          #   а) "Unity-iPhone" если есть
+          #   б) первая схема, у которой WRAPPER_EXTENSION=app (приложение)
+          #   в) иначе первая из списка
+          XCODE_SCHEME=""
+
+          for s in "${ALL_SCHEMES[@]}"; do
+            if [ "$s" = "Unity-iPhone" ]; then
+              XCODE_SCHEME="$s"
+              break
+            fi
+          done
 
           if [ -z "$XCODE_SCHEME" ]; then
-            echo "❌ No shared schemes found. Open Xcode → Product → Scheme → Manage Schemes… → enable “Shared”." >&2
-            echo "xcodebuild -list output for debug:"
-            printf '%s\n' "$LIST_TXT"
+            for s in "${ALL_SCHEMES[@]}"; do
+              if [ -n "${XCODE_WORKSPACE:-}" ]; then
+                if xcodebuild -workspace "$XCODE_WORKSPACE" -scheme "$s" -showBuildSettings 2>/dev/null | grep -q "WRAPPER_EXTENSION = app"; then
+                  XCODE_SCHEME="$s"; break
+                fi
+              else
+                if xcodebuild -project "$XCODE_PROJECT" -scheme "$s" -showBuildSettings 2>/dev/null | grep -q "WRAPPER_EXTENSION = app"; then
+                  XCODE_SCHEME="$s"; break
+                fi
+              fi
+            done
+          fi
+
+          if [ -z "$XCODE_SCHEME" ] && [ "${#ALL_SCHEMES[@]}" -gt 0 ]; then
+            XCODE_SCHEME="${ALL_SCHEMES[0]}"
+          fi
+
+          if [ -z "$XCODE_SCHEME" ]; then
+            echo "❌ No shared schemes found. Enable 'Shared' in Xcode." >&2
+            printf 'xcodebuild -list output:\n%s\n' "$LIST_TXT"
             exit 66
           fi
 
           echo "Detected scheme: $XCODE_SCHEME"
           echo "XCODE_SCHEME=$XCODE_SCHEME" >> "$CM_ENV"
+
+      - name: "Patch Unity 'Run Script' phases that break CI"
+        script: |
+          set -euo pipefail
+          # Отключаем PBXShellScriptBuildPhase с именем "Run Script" (НЕ трогаем [CP] у Pods)
+          if [ -n "${XCODE_PROJECT:-}" ]; then
+            PBXPROJ="$XCODE_PROJECT/project.pbxproj"
+          else
+            # workspace -> project с тем же именем
+            PNAME="$(basename "$XCODE_WORKSPACE" .xcworkspace)"
+            PBXPROJ="$PNAME.xcodeproj/project.pbxproj"
+          fi
+
+          if [ ! -f "$PBXPROJ" ]; then
+            echo "⚠️  project.pbxproj not found at $PBXPROJ, skip patch"; exit 0
+          fi
+
+          cp "$PBXPROJ" "$PBXPROJ.bak"
+
+          # Меняем содержимое shellScript для фаз с name = "Run Script"
+          awk '
+            /isa = PBXShellScriptBuildPhase;/ {inblk=1}
+            inblk && /name = "Run Script";/ {mark=1}
+            inblk && mark && /shellScript = / {
+              sub(/shellScript =.*/, "shellScript = \"echo Skipped Unity Run Script on CI\";");
+              mark=0
+            }
+            inblk && /};/ {inblk=0; mark=0}
+            {print}
+          ' "$PBXPROJ" > "$PBXPROJ.patched"
+
+          mv "$PBXPROJ.patched" "$PBXPROJ"
+          echo "Patched PBXShellScriptBuildPhase \"Run Script\" → echo Skipped"
 
       - name: "Prepare versions"
         script: |
