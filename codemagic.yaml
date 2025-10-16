@@ -5,7 +5,7 @@ workflows:
 
     environment:
       # Codemagic сам установит Unity и задаст $UNITY_HOME
-      # Подставь точную версию из ProjectSettings/ProjectVersion.txt при необходимости
+      # Поставь точную версию из ProjectSettings/ProjectVersion.txt
       unity: "2022.3.62f2"
 
       groups:
@@ -13,11 +13,11 @@ workflows:
         - appstore_connect   # APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY
 
       vars:
-        # Только константы и реально заданные значения — без пустых строк!
+        # Только реально заданные значения — без пустых строк!
         UNITY_LOG: "$CM_BUILD_DIR/unity.log"
         XCODE_SCHEME: "Unity-iPhone"
         BUNDLE_ID: "io.battung.brightbins"
-        TEAM_ID: "OVERRIDE_BY_PROFILE"   # подменится TeamIdentifier из профиля
+        TEAM_ID: "OVERRIDE_BY_PROFILE"   # заменится TeamIdentifier из профиля
         EXPORT_METHOD: "app-store"
         # APP_VERSION: "1.1"             # опц.
         # APP_BUILD: "123"               # опц.
@@ -46,6 +46,48 @@ workflows:
           echo "Using UNITY_HOME: $UNITY_HOME"
           "$UNITY_BIN" -version || true
           echo "UNITY_BIN=$UNITY_BIN" >> "$CM_ENV"
+
+      - name: "Unity | License — activate or create ALF"
+        script: |
+          set -euo pipefail
+          UNITY_BIN="$UNITY_HOME/Contents/MacOS/Unity"
+          LIC_DIR="$CM_BUILD_DIR/licensing"
+          mkdir -p "$LIC_DIR"
+
+          if [ -n "${UNITY_LICENSE_FILE:-}" ]; then
+            echo "UNITY_LICENSE_FILE provided. Applying .ulf..."
+            echo "$UNITY_LICENSE_FILE" | base64 --decode > "$LIC_DIR/Unity.ulf"
+            # попытка применить .ulf (Unity иногда возвращает 0 даже при успешном применении)
+            "$UNITY_BIN" -batchmode -nographics -quit -manualLicenseFile "$LIC_DIR/Unity.ulf" || true
+            echo "License file applied (best-effort)."
+          elif [ -n "${UNITY_SERIAL:-}" ] && { [ -n "${UNITY_USERNAME:-}" ] || [ -n "${UNITY_EMAIL:-}" ]; } && [ -n "${UNITY_PASSWORD:-}" ]; then
+            USER="${UNITY_USERNAME:-${UNITY_EMAIL:-}}"
+            echo "Serial-based activation..."
+            "$UNITY_BIN" -batchmode -nographics -quit \
+              -serial "$UNITY_SERIAL" \
+              -username "$USER" \
+              -password "$UNITY_PASSWORD" || true
+            echo "Serial activation attempted."
+          else
+            echo "No license creds provided. Creating manual activation file (.alf)..."
+            set +e
+            "$UNITY_BIN" -batchmode -nographics -quit -createManualActivationFile
+            RC=$?
+            set -e
+            # Ищем *.alf в стандартных местах
+            ALF="$(ls -1t "$CM_BUILD_DIR"/Unity_*.alf 2>/dev/null | head -n1 || true)"
+            [ -z "$ALF" ] && ALF="$(ls -1t "$HOME"/Unity_*.alf 2>/dev/null | head -n1 || true)"
+            [ -z "$ALF" ] && ALF="$(ls -1t "$HOME"/Library/Unity/Unity_*.alf 2>/dev/null | head -n1 || true)"
+            if [ -n "$ALF" ]; then
+              cp "$ALF" "$LIC_DIR/Unity_v2022.alf"
+              echo "ALF created at: $LIC_DIR/Unity_v2022.alf"
+            else
+              echo "::warning::Could not locate ALF automatically. Listing possible .alf files:"
+              find "$HOME" -maxdepth 4 -name "*.alf" -print || true
+            fi
+            echo "::error::Unity license is required. Download .ULF from license.unity3d.com using the ALF artifact and set UNITY_LICENSE_FILE (base64) in Codemagic."
+            exit 1
+          fi
 
       - name: "Detect Unity project root & set paths"
         script: |
@@ -78,7 +120,6 @@ workflows:
           XCODE_PROJECT="$UNITY_BUILD_DIR/Unity-iPhone.xcodeproj"
           XCODE_WORKSPACE="$UNITY_BUILD_DIR/Unity-iPhone.xcworkspace"
 
-          # Экспортируем для следующих шагов
           {
             echo "UNITY_PROJECT_DIR=$UNITY_PROJECT_DIR"
             echo "UNITY_BUILD_DIR=$UNITY_BUILD_DIR"
@@ -89,13 +130,8 @@ workflows:
       - name: "Unity | Ensure CI.cs (safe writer)"
         script: |
           set -euo pipefail
-          if [ -z "${UNITY_PROJECT_DIR:-}" ]; then
-            echo "::error::UNITY_PROJECT_DIR is empty."
-            exit 1
-          fi
           mkdir -p "$UNITY_PROJECT_DIR/Assets/Editor"
           CI_FILE="$UNITY_PROJECT_DIR/Assets/Editor/CI.cs"
-
           if [ ! -f "$CI_FILE" ]; then
             {
               printf '%s\n' 'using System.Linq;'
@@ -144,10 +180,6 @@ workflows:
       - name: "Unity | Build iOS Xcode project (always dump log on failure)"
         script: |
           set -euo pipefail
-          if [ -z "${UNITY_HOME:-}" ] || [ -z "${UNITY_PROJECT_DIR:-}" ]; then
-            echo "::error::UNITY_HOME or UNITY_PROJECT_DIR is empty."
-            exit 1
-          fi
           UNITY_BIN="$UNITY_HOME/Contents/MacOS/Unity"
           mkdir -p "$UNITY_BUILD_DIR"
 
@@ -324,6 +356,7 @@ workflows:
       - $CM_EXPORT_DIR/*.dSYM.zip
       - $CM_EXPORT_DIR/*.xcarchive
       - $CM_BUILD_DIR/unity.log
+      - $CM_BUILD_DIR/licensing/*.alf   # ← чтобы ты забрал ALF при первом прогоне без лицензии
 
     publishing:
       app_store_connect:
