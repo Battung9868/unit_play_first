@@ -14,14 +14,14 @@ workflows:
         # APP_BUILD: "123"
 
     scripts:
-      - name: "Git LFS (pull больших Unity-бинарников)"
+      - name: "Git LFS (большие Unity-бинарники)"
         script: |
           set -euo pipefail
           git lfs install
           git lfs fetch
           git lfs checkout
 
-      - name: "Import certificate and provisioning profile"
+      - name: "Импорт сертификата и профиля"
         script: |
           set -euo pipefail
 
@@ -65,7 +65,7 @@ workflows:
           EOI
           /usr/bin/plutil -lint exportOptions.plist
 
-      - name: "Locate Xcode project/workspace & install CocoaPods if needed"
+      - name: "Найти Xcode проект/воркспейс и схему"
         script: |
           set -euo pipefail
 
@@ -129,7 +129,7 @@ workflows:
           echo "Detected scheme: $XCODE_SCHEME"
           echo "XCODE_SCHEME=$XCODE_SCHEME" >> "$CM_ENV"
 
-      - name: "Apply manual signing (app target only)"
+      - name: "Manual signing только для app-таргета"
         script: |
           set -euo pipefail
           if [ -n "${XCODE_PROJECT:-}" ]; then
@@ -140,7 +140,7 @@ workflows:
           echo "Applying profiles to: $PROJ_PATH"
           xcode-project use-profiles --project "$PROJ_PATH" --export-options-plist exportOptions.plist
 
-      - name: "Neutralize Unity IL2CPP/Bee Run Script (GameAssembly)"
+      - name: "Отключить Unity IL2CPP/Bee Run Script (GameAssembly) — без Python"
         script: |
           set -euo pipefail
           if [ -n "${XCODE_PROJECT:-}" ]; then
@@ -153,22 +153,16 @@ workflows:
 
           cp "$PBXPROJ" "$PBXPROJ.bak"
 
-          python3 - <<'PY'
-import os, re, sys
-pbx = os.environ['PBXPROJ']
-with open(pbx,'r',encoding='utf-8') as f:
-    s = f.read()
-orig = s
-# Гасим любые shellScript с упоминанием IL2CPP/Bee
-pat = re.compile(r'(shellScript = ")(?:[^"\\]|\\.)*(Il2CppOutputProject|bee_backend|deploy_arm64|il2cpp)(?:[^"\\]|\\.)*(";)', re.I|re.S)
-s, n = pat.subn(r'\1echo Skipped IL2CPP/Bee on CI;\3', s)
-with open(pbx,'w',encoding='utf-8') as f:
-    f.write(s)
-print(f"Patched {n} IL2CPP/Bee script(s) in {pbx}")
-PY
+          # На любой строке shellScript, где фигурируют Il2Cpp/Bee/il2cpp, заменяем на echo
+          awk 'BEGIN{IGNORECASE=1}
+               /shellScript = "/ && /(Il2CppOutputProject|bee_backend|deploy_arm64|il2cpp)/ {
+                 sub(/shellScript = ".*";/, "shellScript = \"echo Skipped IL2CPP/Bee on CI;\";");
+               }
+               {print}' "$PBXPROJ" > "$PBXPROJ.tmp"
+          mv "$PBXPROJ.tmp" "$PBXPROJ"
 
-          echo "Verify patch lines:"
-          grep -n "Skipped IL2CPP/Bee on CI" "$PBXPROJ" || true
+          echo "Patched lines:"
+          grep -n 'shellScript = "echo Skipped IL2CPP/Bee on CI;' "$PBXPROJ" || true
 
       - name: "Prepare versions"
         script: |
