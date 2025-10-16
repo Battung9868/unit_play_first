@@ -5,7 +5,7 @@ workflows:
 
     environment:
       # Codemagic сам установит Unity и задаст $UNITY_HOME
-      # Подставь точную версию из ProjectSettings/ProjectVersion.txt
+      # Подставь точную версию из ProjectSettings/ProjectVersion.txt при необходимости
       unity: "2022.3.62f2"
 
       groups:
@@ -13,24 +13,14 @@ workflows:
         - appstore_connect   # APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY
 
       vars:
-        # Будут определены после авто-детекта проекта/билда:
-        UNITY_PROJECT_DIR: ""
-        UNITY_BUILD_DIR: ""
+        # Только константы и реально заданные значения — без пустых строк!
         UNITY_LOG: "$CM_BUILD_DIR/unity.log"
-
-        # ---- Xcode targets, генерируемые Unity ----
-        XCODE_PROJECT: ""
-        XCODE_WORKSPACE: ""
         XCODE_SCHEME: "Unity-iPhone"
-
-        # ---- Identity / подпись ----
         BUNDLE_ID: "io.battung.brightbins"
-        TEAM_ID: "OVERRIDE_BY_PROFILE"
+        TEAM_ID: "OVERRIDE_BY_PROFILE"   # подменится TeamIdentifier из профиля
         EXPORT_METHOD: "app-store"
-
-        # ---- Версии (опционально) ----
-        # APP_VERSION: "1.1"
-        # APP_BUILD: "123"
+        # APP_VERSION: "1.1"             # опц.
+        # APP_BUILD: "123"               # опц.
 
     cache:
       cache_paths:
@@ -61,17 +51,14 @@ workflows:
         script: |
           set -euo pipefail
           detect_project_dir() {
-            # 1) Репо-корень?
             if [ -d "$CM_BUILD_DIR/Assets" ] && [ -d "$CM_BUILD_DIR/ProjectSettings" ]; then
               echo "$CM_BUILD_DIR"; return
             fi
-            # 2) Один уровень ниже
             found="$(find "$CM_BUILD_DIR" -maxdepth 2 -type d -name Assets -prune -print | while read -r a; do
               d="$(dirname "$a")"
               if [ -d "$d/ProjectSettings" ]; then echo "$d"; fi
             done | head -n1)"
             if [ -n "$found" ]; then echo "$found"; return; fi
-            # 3) Любая вложенность (первое совпадение)
             found="$(find "$CM_BUILD_DIR" -type d -name ProjectSettings -print | while read -r ps; do
               d="$(dirname "$ps")"
               if [ -d "$d/Assets" ]; then echo "$d"; fi
@@ -87,14 +74,17 @@ workflows:
           fi
           echo "Unity project detected at: $UNITY_PROJECT_DIR"
 
-          # Папка для iOS-экспорта:
           UNITY_BUILD_DIR="$UNITY_PROJECT_DIR/Build/iOS"
-          echo "UNITY_PROJECT_DIR=$UNITY_PROJECT_DIR" >> "$CM_ENV"
-          echo "UNITY_BUILD_DIR=$UNITY_BUILD_DIR"     >> "$CM_ENV"
+          XCODE_PROJECT="$UNITY_BUILD_DIR/Unity-iPhone.xcodeproj"
+          XCODE_WORKSPACE="$UNITY_BUILD_DIR/Unity-iPhone.xcworkspace"
 
-          # Пути к Xcode артефактам, которые создаёт Unity
-          echo "XCODE_PROJECT=$UNITY_BUILD_DIR/Unity-iPhone.xcodeproj"   >> "$CM_ENV"
-          echo "XCODE_WORKSPACE=$UNITY_BUILD_DIR/Unity-iPhone.xcworkspace" >> "$CM_ENV"
+          # Экспортируем для следующих шагов
+          {
+            echo "UNITY_PROJECT_DIR=$UNITY_PROJECT_DIR"
+            echo "UNITY_BUILD_DIR=$UNITY_BUILD_DIR"
+            echo "XCODE_PROJECT=$XCODE_PROJECT"
+            echo "XCODE_WORKSPACE=$XCODE_WORKSPACE"
+          } >> "$CM_ENV"
 
       - name: "Unity | Ensure CI.cs (safe writer)"
         script: |
@@ -118,7 +108,6 @@ workflows:
               printf '%s\n' '{'
               printf '%s\n' '    public static void BuildiOS()'
               printf '%s\n' '    {'
-              printf '%s\n' '        // Собираем сцены: если в Build Settings пусто — найдём все .unity в проекте'
               printf '%s\n' '        var enabledScenes = EditorBuildSettings.scenes.Where(s => s.enabled).Select(s => s.path).ToArray();'
               printf '%s\n' '        string[] scenes = enabledScenes.Length > 0 ? enabledScenes :'
               printf '%s\n' '            AssetDatabase.FindAssets("t:Scene")'
@@ -132,7 +121,6 @@ workflows:
               printf '%s\n' '        var outDir = System.Environment.GetEnvironmentVariable("UNITY_BUILD_DIR");'
               printf '%s\n' '        if (string.IsNullOrEmpty(outDir)) outDir = "Build/iOS";'
               printf '%s\n' ''
-              printf '%s\n' '        // Гарантируем iOS target'
               printf '%s\n' '        EditorUserBuildSettings.SwitchActiveBuildTarget(BuildTargetGroup.iOS, BuildTarget.iOS);'
               printf '%s\n' ''
               printf '%s\n' '        var options = new BuildPlayerOptions {'
