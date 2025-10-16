@@ -4,42 +4,87 @@ workflows:
     max_build_duration: 60
 
     environment:
+      # (опционально) зафиксировать Xcode
+      xcode: 16.4
       groups:
-        - signing
-        - appstore_connect
+        - signing            # CERTIFICATE_P12, CERTIFICATE_PASSWORD, MOBILEPROVISION (в base64)
+        - appstore_connect   # APP_STORE_CONNECT_PRIVATE_KEY, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_ISSUER_ID
       vars:
         BUNDLE_ID: "io.battung.brightbins"
         EXPORT_METHOD: "app-store"
+        # APP_VERSION: "1.1"   # можно задать маркетинговую версию тут
+        # APP_BUILD: "123"     # можно принудительно задать номер билда (иначе автоинкремент)
 
     scripts:
-      - name: "Git LFS (большие Unity-бинарники)"
+      - name: Git LFS (большие Unity-бинарники)
         script: |
           set -euo pipefail
           git lfs install
           git lfs fetch
           git lfs checkout
 
-      - name: "Импорт сертификата и профиля"
+      - name: Импорт сертификата и профиля
         script: |
-          # (оставь как в предыдущей версии — без изменений)
-          :
+          set -euo pipefail
 
-      - name: "Найти Xcode проект/воркспейс и схему"
+          # Создаём и разблокируем временный keychain
+          security create-keychain -p "" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "" build.keychain
+          security set-keychain-settings -lut 21600 build.keychain
+
+          # Импорт сертификата (p12 в base64 из группы "signing")
+          echo "$CERTIFICATE_P12" | base64 --decode > cert.p12
+          security import cert.p12 -k build.keychain -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign -A
+          rm -f cert.p12
+          security find-identity -v -p codesigning build.keychain || true
+
+          # Устанавливаем provisioning profile
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          PP="$HOME/Library/MobileDevice/Provisioning Profiles/app.mobileprovision"
+          echo "$MOBILEPROVISION" | base64 --decode > "$PP"
+
+          # Достаём TeamID и имя профиля — сохраним в переменных для следующих шагов
+          TMP_PLIST="$(mktemp)"
+          security cms -D -i "$PP" > "$TMP_PLIST"
+          TEAM_ID=$(/usr/libexec/PlistBuddy -c "Print :TeamIdentifier:0" "$TMP_PLIST")
+          PROFILE_NAME=$(/usr/libexec/PlistBuddy -c "Print :Name" "$TMP_PLIST")
+          rm -f "$TMP_PLIST"
+
+          echo "Using Team: $TEAM_ID, Profile: $PROFILE_NAME"
+          {
+            echo "export DEVELOPMENT_TEAM=$TEAM_ID"
+            echo "export PROFILE_NAME=$PROFILE_NAME"
+            echo "export CODE_SIGN_IDENTITY=Apple Distribution"
+          } >> "$CM_ENV"
+
+      - name: Найти Xcode проект/воркспейс и схему
         script: |
-          # (оставь как в предыдущей версии — без изменений)
-          :
+          set -euo pipefail
+          # Если есть Pods — соберём воркспейс, иначе проект
+          if compgen -G "*.xcworkspace" > /dev/null; then
+            WORKSPACE="$(ls -1d *.xcworkspace | head -n1)"
+            echo "export PROJ_ARG='-workspace \"$WORKSPACE\"'" >> "$CM_ENV"
+          else
+            PROJ="$(ls -1d *.xcodeproj | head -n1)"
+            echo "export PROJ_ARG='-project \"$PROJ\"'" >> "$CM_ENV"
+          fi
 
-      - name: "Manual signing только для app-таргета"
-        script: |
-          # (оставь как в предыдущей версии — без изменений)
-          :
+          # Схема по умолчанию — Unity-iPhone. Если её нет, возьмём первую попавшуюся.
+          SCHEME="Unity-iPhone"
+          if ! eval xcodebuild -list $PROJ_ARG | grep -q "^[[:space:]]*$SCHEME$"; then
+            DETECTED="$(eval xcodebuild -list $PROJ_ARG | sed -n '/Schemes:/,/^$/p' | sed '1d;$d' | head -n1 | xargs || true)"
+            [ -n "$DETECTED" ] && SCHEME="$DETECTED"
+          fi
+          echo "Using scheme: $SCHEME"
+          echo "export SCHEME='$SCHEME'" >> "$CM_ENV"
 
-      # ⛔️ ВАЖНО: этот шаг мы УБРАЛИ
-      # - name: "Отключить Unity IL2CPP/Bee Run Script (GameAssembly) — без Python"
-      #   script: | ...
-      # ---------------------------------------------
+          # Если есть Podfile — установим поды
+          if [ -f Podfile ]; then
+            pod install --repo-update
+          fi
 
-      - name: "Проверка наличия IL2CPP toolchain в проекте"
+      - name: Проверка наличия IL2CPP toolchain в репозитории
         script: |
           set -euo pipefail
           ROOT="$(pwd)"
@@ -50,35 +95,95 @@ workflows:
           IL2CPP_1="$DEPLOY_DIR_1/il2cpp"
           IL2CPP_2="$DEPLOY_DIR_2/il2cpp"
 
-          echo "Проверяю Il2CppOutputProject содержимое…"
+          echo "Поиск Il2CppOutputProject/*/build/deploy* …"
           find Il2CppOutputProject -maxdepth 3 -type d -name "deploy*" -print || true
 
-          if [ -x "$IL2CPP_1" ] && [ -x "$BEE_1" ]; then
-            echo "OK: найдено $DEPLOY_DIR_1"
-          elif [ -x "$IL2CPP_2" ] && [ -x "$BEE_2" ]; then
-            echo "OK: найдено $DEPLOY_DIR_2"
+          if { [ -x "$IL2CPP_1" ] && [ -x "$BEE_1" ]; } || { [ -x "$IL2CPP_2" ] && [ -x "$BEE_2" ]; }; then
+            echo "OK: il2cpp и bee в репозитории найдены."
           else
-            echo "❌ Il2CPP/bee не найдены в репозитории."
-            echo "Нужно заново экспортировать Xcode-проект из Unity и ЗАКОМИТИТЬ эти каталоги:"
-            echo "  Il2CppOutputProject/IL2CPP/build/deploy_arm64  (или build/deploy)"
-            echo "  Il2CppOutputProject/IL2CPP/build/bee_backend"
-            echo
-            echo "Подсказка по LFS:"
-            echo "  git lfs track \"Il2CppOutputProject/IL2CPP/build/**\""
-            echo "  git add .gitattributes Il2CppOutputProject/IL2CPP/build"
-            echo "  git commit -m \"Add il2cpp deploy and bee backend\" && git push"
+            echo "❌ Il2CPP/bee не найдены. Убедись, что закоммитил Il2CppOutputProject/IL2CPP/build/** (через Git LFS)."
             exit 65
           fi
 
-      - name: "Prepare versions"
+      - name: Подготовка версий (Info.plist)
         script: |
-          # (оставь как в предыдущей версии — без изменений)
-          :
+          set -euo pipefail
+          PLIST="Info.plist"
+          if [ -f "$PLIST" ]; then
+            # Маркетинговая версия
+            if [ -n "${APP_VERSION:-}" ]; then
+              /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "$PLIST" || \
+              /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $APP_VERSION" "$PLIST"
+            fi
+            # Номер билда
+            if [ -n "${APP_BUILD:-}" ]; then
+              NEW_BUILD="$APP_BUILD"
+            else
+              CUR=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$PLIST" 2>/dev/null || echo "0")
+              if [[ "$CUR" =~ ^[0-9]+$ ]]; then NEW_BUILD=$((CUR+1)); else NEW_BUILD=$(date +%Y%m%d%H%M); fi
+            fi
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $NEW_BUILD" "$PLIST" || \
+            /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $NEW_BUILD" "$PLIST"
 
-      - name: "Archive and export IPA"
+            # На всякий — проставим BUNDLE_ID напрямую
+            /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$PLIST" || true
+
+            echo "export APP_BUILD=$NEW_BUILD" >> "$CM_ENV"
+            echo "Version prepared: ${APP_VERSION:-(keep)} ($NEW_BUILD)"
+          else
+            echo "Info.plist не найден — пропускаю смену версий."
+          fi
+
+      - name: Archive and export IPA
         script: |
-          # (оставь как в предыдущей версии — без изменений)
-          :
+          set -euo pipefail
+          set -x
+
+          # На всякий — решить зависимости SPM (если есть)
+          eval xcodebuild -resolvePackageDependencies $PROJ_ARG -scheme "$SCHEME" || true
+
+          ARCHIVE_PATH="$CM_BUILD_DIR/$SCHEME.xcarchive"
+
+          # Архив
+          eval xcodebuild archive $PROJ_ARG \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -archivePath "$ARCHIVE_PATH" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
+            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            CODE_SIGN_IDENTITY="$CODE_SIGN_IDENTITY" \
+            | tee "$CM_BUILD_DIR/xcodebuild-archive.log"
+
+          # exportOptions.plist
+          cat > exportOptions.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>${EXPORT_METHOD}</string>
+            <key>teamID</key><string>${DEVELOPMENT_TEAM}</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>${BUNDLE_ID}</key><string>${PROFILE_NAME}</string>
+            </dict>
+            <key>destination</key><string>export</string>
+            <key>compileBitcode</key><false/>
+            <key>stripSwiftSymbols</key><true/>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+          </dict>
+          </plist>
+          EOF
+
+          # Экспорт IPA
+          xcodebuild -exportArchive \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportOptionsPlist exportOptions.plist \
+            -exportPath "$CM_EXPORT_DIR"
+
+          ls -lah "$CM_EXPORT_DIR"
 
     artifacts:
       - $CM_BUILD_DIR/xcodebuild-archive.log
@@ -92,3 +197,6 @@ workflows:
         key_id: $APP_STORE_CONNECT_KEY_IDENTIFIER
         issuer_id: $APP_STORE_CONNECT_ISSUER_ID
         submit_to_testflight: true
+        # при необходимости можно указать тест-группы:
+        # groups:
+        #   - Internal Testers
