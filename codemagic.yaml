@@ -9,9 +9,9 @@ workflows:
         - appstore_connect   # APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY
       vars:
         BUNDLE_ID: "io.battung.brightbins"
-        EXPORT_METHOD: "app-store"   # "app-store" или "ad-hoc"/"enterprise"
-        # APP_VERSION: "1.1"         # опционально: маркетинговая версия
-        # APP_BUILD: "123"           # опционально: билд-номер вручную
+        EXPORT_METHOD: "app-store"   # "app-store" / "ad-hoc" / "enterprise"
+        # APP_VERSION: "1.1"         # (опц.) маркетинговая версия
+        # APP_BUILD: "123"           # (опц.) номер билда вручную
 
     scripts:
       - name: "Git LFS (для тяжёлых Unity-бинарников)"
@@ -70,9 +70,9 @@ workflows:
         script: |
           set -euo pipefail
 
-          # 1) Ищем сначала .xcworkspace, если нет — .xcodeproj (в любых подпапках)
-          TARGET_WS="$(find . -type f -name "*.xcworkspace" -print -quit || true)"
-          TARGET_PR="$(find . -type f -name "*.xcodeproj"   -print -quit || true)"
+          # 1) Ищем сначала .xcworkspace (директория), если нет — .xcodeproj (директория), в ЛЮБОЙ подпапке
+          TARGET_WS="$(find . -type d -name "*.xcworkspace" -prune -print -quit || true)"
+          TARGET_PR="$(find . -type d -name "*.xcodeproj"   -prune -print -quit || true)"
 
           if [ -n "$TARGET_WS" ]; then
             TARGET_DIR="$(dirname "$TARGET_WS")"
@@ -88,6 +88,8 @@ workflows:
             echo "XCODE_PROJECT=$XCODE_PROJECT" >> "$CM_ENV"
           else
             echo "❌ No .xcworkspace or .xcodeproj found in repo" >&2
+            echo "Repo tree (depth 3) for debug:"
+            find . -maxdepth 3 -print | sed -n '1,300p'
             exit 66
           fi
 
@@ -103,28 +105,20 @@ workflows:
             fi
           fi
 
-          # 3) Получаем список схем (JSON → фолбек на текст)
+          # 3) Получаем список схем из текстового вывода (без JSON)
           if [ -n "${XCODE_WORKSPACE:-}" ]; then
-            LIST_JSON="$(xcodebuild -workspace "$XCODE_WORKSPACE" -list -json 2>/dev/null || true)"
+            LIST_TXT="$(xcodebuild -workspace "$XCODE_WORKSPACE" -list 2>/dev/null || true)"
           else
-            LIST_JSON="$(xcodebuild -project "$XCODE_PROJECT" -list -json 2>/dev/null || true)"
+            LIST_TXT="$(xcodebuild -project "$XCODE_PROJECT" -list 2>/dev/null || true)"
           fi
 
-          # Безопасный парсинг JSON (если пусто — вернёт пустую строку)
-          XCODE_SCHEME="$(printf '%s' "$LIST_JSON" | /usr/bin/python3 -c 'import sys,json; t=sys.stdin.read(); d=json.loads(t) if t.strip() else {}; w=d.get("workspace") or d.get("project") or {}; s=w.get("schemes") or []; print(s[0] if s else "")')"
-
-          # Фолбек: парсим текстовый вывод `xcodebuild -list`
-          if [ -z "$XCODE_SCHEME" ]; then
-            if [ -n "${XCODE_WORKSPACE:-}" ]; then
-              LIST_TXT="$(xcodebuild -workspace "$XCODE_WORKSPACE" -list 2>/dev/null || true)"
-            else
-              LIST_TXT="$(xcodebuild -project "$XCODE_PROJECT" -list 2>/dev/null || true)"
-            fi
-            XCODE_SCHEME="$(printf '%s\n' "$LIST_TXT" | awk '/Schemes:/{flag=1;next} flag && NF {print; exit}')"
-          fi
+          # Берём первую непустую строку после "Schemes:"
+          XCODE_SCHEME="$(printf '%s\n' "$LIST_TXT" | awk '/Schemes:/{flag=1;next} flag && NF {print; exit}' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
 
           if [ -z "$XCODE_SCHEME" ]; then
             echo "❌ No shared schemes found. Open Xcode → Product → Scheme → Manage Schemes… → enable “Shared”." >&2
+            echo "xcodebuild -list output for debug:"
+            printf '%s\n' "$LIST_TXT"
             exit 66
           fi
 
