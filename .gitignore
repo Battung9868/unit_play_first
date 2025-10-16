@@ -1,4 +1,4 @@
-# Xcode
+# === Xcode & build artifacts ===
 *.xcuserdatad/
 xcuserdata/
 *.mode1v3
@@ -11,18 +11,25 @@ build/
 *.dSYM
 *.dSYM.zip
 
-# macOS
-.DS_Store
+# Если workspace генерится CocoaPods — не коммитим
+*.xcworkspace
 
-# CocoaPods
+# === CocoaPods ===
 Pods/
 !Podfile
 !Podfile.lock
 
-# SwiftPM / Carthage (если не нужны — оставьте)
+# === SwiftPM / Carthage (если не используешь) ===
 .build/
 Carthage/Build/
 
-# Misc
+# === macOS ===
+.DS_Store
+
+# === Editors (опционально) ===
+.idea/
+.vscode/
+
+# === Temp files ===
 *.tmp
 *.swp
