@@ -1,5 +1,5 @@
 workflows:
-  ios_appstore_manual_signing:
+  ios_appstore_signing:
     name: "iOS App Store (Unity Xcode, auto → manual fallback)"
     max_build_duration: 60
     # instance_type: mac_mini_m2
@@ -12,9 +12,9 @@ workflows:
         BUNDLE_ID: io.battung.brightbins
         DEVELOPMENT_TEAM: R35GJ22D76
         SCHEME: Unity-iPhone
-        XCODE_PROJECT: "Unity-iPhone.xcodeproj"   # .xcodeproj в корне
-        PROFILE_NAME: BrightBins                  # ИМЯ профиля (НЕ UUID)
-        EXPORT_METHOD: app-store-connect          # новое название вместо "app-store"
+        XCODE_PROJECT: "Unity-iPhone.xcodeproj"     # у тебя .xcodeproj в корне
+        PROFILE_NAME: BrightBins                    # имя профиля ИЗ Dev Portal (НЕ UUID)
+        EXPORT_METHOD: app-store-connect            # новое имя метода
 
     scripts:
       - name: "Git LFS (Unity бинарники)"
@@ -46,7 +46,7 @@ workflows:
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_NAME"
           security find-identity -v -p codesigning "$KEYCHAIN_NAME" || true
 
-          # Профиль (путь или base64) → в систему
+          # Профиль (путь или base64) → кладём в систему
           PROF_FILE="profile.mobileprovision"
           if [ -n "${MOBILEPROVISION:-}" ] && [ -f "${MOBILEPROVISION:-/dev/null}" ]; then
             PROF_FILE="$MOBILEPROVISION"
@@ -62,35 +62,24 @@ workflows:
 
           PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" "$TMP_PLIST")
           PROFILE_NAME_DETECTED=$(/usr/libexec/PlistBuddy -c "Print Name" "$TMP_PLIST" 2>/dev/null || true)
-          APP_IDENTIFIER=$(/usr/libexec/PlistBuddy -c "Print Entitlements:application-identifier" "$TMP_PLIST")
+          APP_IDENTIFIER=$(/usr/libexec/PlistBuddy -c "Print Entitlements:application-identifier" "$TMP_PLIST" 2>/dev/null || echo "")
           GET_TASK_ALLOW=$(/usr/libexec/PlistBuddy -c "Print Entitlements:get-task-allow" "$TMP_PLIST" 2>/dev/null || echo "nil")
 
           cp "$PROF_FILE" "$PROFILE_DIR/$PROFILE_UUID.mobileprovision"
 
           echo "export PROFILE_UUID=\"$PROFILE_UUID\"" >> "$CM_ENV"
-          if [ -n "${PROFILE_NAME:-}" ]; then
-            echo "export PROFILE_NAME=\"$PROFILE_NAME\"" >> "$CM_ENV"
-          else
-            echo "export PROFILE_NAME=\"$PROFILE_NAME_DETECTED\"" >> "$CM_ENV"
-          fi
+          echo "export PROFILE_NAME=\"${PROFILE_NAME:-$PROFILE_NAME_DETECTED}\"" >> "$CM_ENV"
 
           echo "PROFILE_UUID=$PROFILE_UUID"
           echo "PROFILE_NAME=${PROFILE_NAME:-$PROFILE_NAME_DETECTED}"
           echo "application-identifier=$APP_IDENTIFIER"
           echo "get-task-allow=$GET_TASK_ALLOW"
 
-          case "$APP_IDENTIFIER" in
-            *."$BUNDLE_ID"|"$DEVELOPMENT_TEAM.$BUNDLE_ID") : ;;
-            *) echo "WARNING: профиль может не соответствовать $BUNDLE_ID";;
-          esac
-
       - name: "Sanity: .xcodeproj exists"
         script: |
           set -eu
-          echo "PWD=$(pwd)"
-          ls -la
           test -d "$XCODE_PROJECT" || { echo "ERROR: не найден проект: $XCODE_PROJECT"; exit 1; }
-          echo "OK: проект найден."
+          echo "OK: проект найден: $XCODE_PROJECT"
 
       - name: "Поднять номер сборки (CFBundleVersion)"
         script: |
@@ -107,7 +96,7 @@ workflows:
             echo "WARNING: Info.plist не найден — пропускаю"
           fi
 
-      - name: "Archive and export IPA (auto then manual)"
+      - name: "Archive and export IPA (auto → manual)"
         script: |
           set -eu
           : "${DEVELOPMENT_TEAM:?Missing DEVELOPMENT_TEAM}"
@@ -123,7 +112,7 @@ workflows:
           CM_EXPORT_DIR="${CM_EXPORT_DIR:-$CM_BUILD_DIR/Export}"
           mkdir -p "$CM_EXPORT_DIR"
 
-          # Архив без подписи
+          # 1) Архив без подписи
           xcodebuild -resolvePackageDependencies -project "$XCODE_PROJECT" -scheme "$CHOSEN_SCHEME"
           xcodebuild archive \
             -project "$XCODE_PROJECT" \
@@ -136,7 +125,12 @@ workflows:
             CODE_SIGNING_REQUIRED=NO \
           | tee "$CM_BUILD_DIR/xcodebuild-archive.log"
 
-          # Экспорт: сначала automatic (чтобы UnityFramework не требовал профиль)
+          # Диагностика: какой bundle id реально лежит в архиве
+          if [ -f "$ARCHIVE_PATH/Info.plist" ]; then
+            /usr/libexec/PlistBuddy -c "Print ApplicationProperties:CFBundleIdentifier" "$ARCHIVE_PATH/Info.plist" || true
+          fi
+
+          # 2) Экспорт с АВТО-подписанием
           cat > exportOptions_auto.plist <<'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -170,9 +164,10 @@ workflows:
 
           IPA_PATH="$(find "$CM_EXPORT_DIR" -name '*.ipa' -print -quit || true)"
           if [ "$XCB_RET" -ne 0 ] || [ -z "$IPA_PATH" ]; then
-            echo "Auto export failed or no IPA. Trying manual for app bundle..."
+            echo "Auto export failed or no IPA. Trying MANUAL for app bundle only…"
 
-            # manual только для основного app bundle
+            # 3) MANUAL-подписание ТОЛЬКО для основного bundle id
+            #   ВАЖНО: без signingCertificate, чтобы фреймворки не требовали профиль
             cat > exportOptions_manual.plist <<EOF
             <?xml version="1.0" encoding="UTF-8"?>
             <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -184,8 +179,6 @@ workflows:
               <string>${DEVELOPMENT_TEAM}</string>
               <key>signingStyle</key>
               <string>manual</string>
-              <key>signingCertificate</key>
-              <string>Apple Distribution</string>
               <key>provisioningProfiles</key>
               <dict>
                 <key>${BUNDLE_ID}</key>
