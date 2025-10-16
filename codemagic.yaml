@@ -2,7 +2,7 @@ workflows:
   ios_appstore_manual_signing:
     name: iOS App Store (Unity Xcode, manual signing)
     max_build_duration: 60
-    # instance_type: mac_mini_m2   # можно раскомментировать при необходимости
+    # instance_type: mac_mini_m2   # можно включить фиксированный образ
 
     environment:
       groups:
@@ -11,9 +11,9 @@ workflows:
       vars:
         BUNDLE_ID: io.battung.brightbins
         SCHEME: Unity-iPhone
-        CHOSEN_SCHEME: Unity-iPhone    # фолбэк на случай пропуска предыдущего шага
+        CHOSEN_SCHEME: Unity-iPhone
         DEVELOPMENT_TEAM: R35GJ22D76
-        PROFILE_NAME: BrightBins
+        PROFILE_NAME: BrightBins          # ИМЯ профиля (Profile Name), не UUID
         EXPORT_METHOD: app-store
 
     scripts:
@@ -27,7 +27,6 @@ workflows:
       - name: Импорт сертификата и профиля
         script: |
           set -euo pipefail
-
           KEYCHAIN_NAME=codemagic.keychain
           KEYCHAIN_PASS="$(uuidgen)"
           security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_NAME"
@@ -35,7 +34,7 @@ workflows:
           security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_NAME"
           security list-keychains -d user -s "$KEYCHAIN_NAME" $(security list-keychains -d user | sed 's/[" ]//g')
 
-          # Сертификат (поддержка secure-файла и base64-переменной)
+          # Сертификат (файл в секрете или base64)
           CERT_FILE="cert.p12"
           if [ -n "${CERTIFICATE_P12:-}" ] && [ -f "${CERTIFICATE_P12:-/dev/null}" ]; then
             CERT_FILE="$CERTIFICATE_P12"
@@ -43,7 +42,7 @@ workflows:
             echo "$CERTIFICATE_P12" | base64 --decode > "$CERT_FILE"
           fi
 
-          # Профиль (поддержка secure-файла и base64-переменной)
+          # Профиль (файл в секрете или base64)
           PROF_FILE="profile.mobileprovision"
           if [ -n "${MOBILEPROVISION:-}" ] && [ -f "${MOBILEPROVISION:-/dev/null}" ]; then
             PROF_FILE="$MOBILEPROVISION"
@@ -51,11 +50,11 @@ workflows:
             echo "$MOBILEPROVISION" | base64 --decode > "$PROF_FILE"
           fi
 
-          # Импорт сертификата
+          # Импорт сертификата в связку
           security import "$CERT_FILE" -k "$KEYCHAIN_NAME" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security -A
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_NAME"
 
-          # Установка профиля
+          # Установка профиля в систему (для этапа export)
           PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
           mkdir -p "$PROFILE_DIR"
           TMP_PLIST="$(mktemp -t prov.plist)"
@@ -67,12 +66,10 @@ workflows:
       - name: Выбрать схему (мгновенно, без list)
         script: |
           set -euo pipefail
-          # 1) Схема: берём из SCHEME или по умолчанию Unity-iPhone
           CHOSEN="${SCHEME:-Unity-iPhone}"
           echo "✅ Using scheme (forced): $CHOSEN"
           echo "export CHOSEN_SCHEME=\"$CHOSEN\"" >> "$CM_ENV"
 
-          # 2) Найти workspace/project без вызова xcodebuild -list
           WS="$(find . -maxdepth 3 -name '*.xcworkspace' | head -n1 || true)"
           PR="$(find . -maxdepth 3 -name '*.xcodeproj'     | head -n1 || true)"
           if [ -n "$WS" ]; then
@@ -107,12 +104,10 @@ workflows:
           : "${BUNDLE_ID:?Missing BUNDLE_ID}"
           : "${EXPORT_METHOD:?Missing EXPORT_METHOD}"
 
-          # Схема с фолбэком
           CHOSEN_SCHEME="${CHOSEN_SCHEME:-${SCHEME:-Unity-iPhone}}"
           [ -z "$CHOSEN_SCHEME" ] && { echo "❌ Нет схемы"; exit 1; }
           echo "✅ Archive will use scheme: $CHOSEN_SCHEME"
 
-          # Определить workspace/project без unbound variable
           if [ -n "${XCODE_WORKSPACE:-}" ]; then
             echo "Using workspace: $XCODE_WORKSPACE"
             PROJ_ARG=(-workspace "$XCODE_WORKSPACE")
@@ -120,23 +115,12 @@ workflows:
             echo "Using project: $XCODE_PROJECT"
             PROJ_ARG=(-project "$XCODE_PROJECT")
           else
-            echo "⚠️ Определяю workspace/project на лету…"
-            WS="$(find . -maxdepth 3 -name '*.xcworkspace' | head -n1 || true)"
-            PR="$(find . -maxdepth 3 -name '*.xcodeproj'     | head -n1 || true)"
-            if [ -n "$WS" ]; then
-              echo "Using workspace (re-detected): $WS"
-              PROJ_ARG=(-workspace "$WS")
-            elif [ -n "$PR" ]; then
-              echo "Using project (re-detected): $PR"
-              PROJ_ARG=(-project "$PR")
-            else
-              echo "❌ Не найден .xcworkspace или .xcodeproj"; exit 1
-            fi
+            echo "❌ Ни workspace, ни project не определены"; exit 1
           fi
 
           ARCHIVE_PATH="$CM_BUILD_DIR/app.xcarchive"
 
-          # НЕ форсим Manual для всех таргетов, чтобы UnityFramework не падал
+          # КЛЮЧЕВОЕ: собираем БЕЗ подписи, чтобы не ломать UnityFramework
           xcodebuild -resolvePackageDependencies "${PROJ_ARG[@]}" -scheme "$CHOSEN_SCHEME"
 
           xcodebuild archive \
@@ -146,7 +130,8 @@ workflows:
             -archivePath "$ARCHIVE_PATH" \
             DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" \
             PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
-            CODE_SIGN_IDENTITY="Apple Distribution" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
           | tee "$CM_BUILD_DIR/xcodebuild-archive.log"
 
           mkdir -p "$CM_EXPORT_DIR"
@@ -161,6 +146,8 @@ workflows:
             <string>__DEVELOPMENT_TEAM__</string>
             <key>signingStyle</key>
             <string>manual</string>
+            <key>signingCertificate</key>
+            <string>Apple Distribution</string>
             <key>provisioningProfiles</key>
             <dict>
               <key>__BUNDLE_ID__</key>
