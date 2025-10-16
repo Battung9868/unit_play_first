@@ -14,7 +14,9 @@ workflows:
         SCHEME: Unity-iPhone
         CHOSEN_SCHEME: Unity-iPhone
         PROFILE_NAME: BrightBins              # имя профиля (НЕ UUID)
-        EXPORT_METHOD: app-store              # корректное значение для App Store
+        EXPORT_METHOD: app-store
+        XCODE_PROJECT: "Unity-iPhone.xcodeproj"
+        # корректное значение для App Store
         # Если проект не в корне — укажи путь явно (одну из строк ниже) и Unity-экспорт не понадобится:
         # XCODE_PROJECT: "Build/iOS/Unity-iPhone.xcodeproj"
         # XCODE_WORKSPACE: "MyApp.xcworkspace"
