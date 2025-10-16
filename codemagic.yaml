@@ -183,9 +183,10 @@ workflows:
           fi
           echo "Planned: CURRENT_PROJECT_VERSION=$BUILD_NUM MARKETING_VERSION=${APP_VERSION:-unchanged}"
 
-      - name: "Archive and export IPA"
+            - name: "Archive and export IPA"
         script: |
           set -euo pipefail
+
           ARCHIVE_PATH="$CM_BUILD_DIR/App.xcarchive"
           EXPORT_PATH="$CM_EXPORT_DIR"
           LOGFILE="$CM_BUILD_DIR/xcodebuild-archive.log"
@@ -208,7 +209,6 @@ workflows:
               DEVELOPMENT_TEAM="$TEAM_ID" \
               CODE_SIGN_STYLE=Manual \
               PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
-              PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
               CODE_SIGN_IDENTITY="Apple Distribution" \
               COMPILER_INDEX_STORE_ENABLE=NO \
               "${EXTRA_FLAGS[@]}" | tee "$LOGFILE"
@@ -223,7 +223,6 @@ workflows:
               DEVELOPMENT_TEAM="$TEAM_ID" \
               CODE_SIGN_STYLE=Manual \
               PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
-              PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
               CODE_SIGN_IDENTITY="Apple Distribution" \
               COMPILER_INDEX_STORE_ENABLE=NO \
               "${EXTRA_FLAGS[@]}" | tee "$LOGFILE"
@@ -246,6 +245,7 @@ workflows:
           echo "Export dir:"
           ls -lah "$EXPORT_PATH"
           test -e "$EXPORT_PATH"/*.ipa
+
 
     artifacts:
       - $CM_BUILD_DIR/xcodebuild-archive.log
