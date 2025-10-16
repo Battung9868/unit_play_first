@@ -2,17 +2,16 @@ workflows:
   ios_appstore_manual_signing:
     name: iOS App Store (Unity Xcode, manual signing)
     max_build_duration: 60
-    xcode: 16.4
+
     environment:
       groups:
         - signing
         - appstore_connect
       vars:
-        # === ПОДСТАВЬ СВОЁ ПРИ НУЖДЕ ===
         BUNDLE_ID: io.battung.brightbins
         SCHEME: Unity-iPhone
         DEVELOPMENT_TEAM: R35GJ22D76
-        PROFILE_NAME: BrightBins         # имя профиля (Profile Name), а НЕ UUID
+        PROFILE_NAME: BrightBins
         EXPORT_METHOD: app-store
 
     scripts:
@@ -34,11 +33,9 @@ workflows:
           security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_NAME"
           security list-keychains -d user -s "$KEYCHAIN_NAME" $(security list-keychains -d user | sed 's/[" ]//g')
 
-          # Сертификат (твои секреты: CERTIFICATE_P12 / CERTIFICATE_PASSWORD)
           security import "$CERTIFICATE_P12" -k "$KEYCHAIN_NAME" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security -A
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_NAME"
 
-          # Профиль подписи (секрет: MOBILEPROVISION)
           PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
           mkdir -p "$PROFILE_DIR"
           TMP_PLIST="$(mktemp -t prov.plist)"
@@ -55,18 +52,15 @@ workflows:
           PR="$(find . -maxdepth 2 -name '*.xcodeproj'     | head -n1 || true)"
 
           if [ -n "$WS" ]; then
-            echo "Using workspace: $WS"
             LIST_ARGS=(-workspace "$WS")
             echo "export XCODE_WORKSPACE=\"$WS\"" >> $CM_ENV
           elif [ -n "$PR" ]; then
-            echo "Using project: $PR"
             LIST_ARGS=(-project "$PR")
             echo "export XCODE_PROJECT=\"$PR\"" >> $CM_ENV
           else
             echo "❌ Не найден .xcworkspace или .xcodeproj"; exit 1
           fi
 
-          # Если указал SCHEME и она есть — берём её, иначе первая из списка
           if [ -n "${SCHEME:-}" ] && xcodebuild -list "${LIST_ARGS[@]}" | grep -q "$SCHEME"; then
             CHOSEN_SCHEME="$SCHEME"
           else
@@ -83,7 +77,6 @@ workflows:
       - name: Поднять номер сборки
         script: |
           set -euo pipefail
-          # Находим Info.plist с твоим bundle id
           INFOPLIST=$(grep -rl --include="Info.plist" "<string>${BUNDLE_ID}</string>" . || true)
           if [ -z "$INFOPLIST" ]; then
             INFOPLIST=$(grep -rl --include="Info.plist" "<key>CFBundleIdentifier</key>" . | head -n1 || true)
@@ -91,8 +84,6 @@ workflows:
           if [ -n "$INFOPLIST" ]; then
             /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $CM_BUILD_ID" "$INFOPLIST" 2>/dev/null || \
             /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $CM_BUILD_ID" "$INFOPLIST"
-          else
-            echo "⚠️ Info.plist не найден — пропускаю"
           fi
 
       - name: Archive and export IPA
@@ -104,7 +95,6 @@ workflows:
           : "${EXPORT_METHOD:?Missing EXPORT_METHOD}"
           : "${CHOSEN_SCHEME:?Missing CHOSEN_SCHEME}"
 
-          # Сформируем аргумент проекта/воркспейса безопасно
           if [ -n "${XCODE_WORKSPACE:-}" ]; then
             PROJ_ARG=(-workspace "$XCODE_WORKSPACE")
           else
@@ -113,10 +103,8 @@ workflows:
 
           ARCHIVE_PATH="$CM_BUILD_DIR/app.xcarchive"
 
-          # SPM зависимости (если есть)
           xcodebuild -resolvePackageDependencies "${PROJ_ARG[@]}" -scheme "$CHOSEN_SCHEME"
 
-          # Архивирование (внимание: никакого экранирования 'Distribution' — просто в кавычках)
           xcodebuild archive \
             "${PROJ_ARG[@]}" \
             -scheme "$CHOSEN_SCHEME" \
@@ -175,4 +163,3 @@ workflows:
         key_id: $APP_STORE_CONNECT_KEY_IDENTIFIER
         issuer_id: $APP_STORE_CONNECT_ISSUER_ID
         submit_to_testflight: true
-        # skip_waiting_for_build_processing: true
