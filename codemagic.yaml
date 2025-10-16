@@ -2,7 +2,7 @@ workflows:
   ios_appstore_manual_signing:
     name: iOS App Store (Unity Xcode, manual signing)
     max_build_duration: 60
-    # instance_type: mac_mini_m2   # можно зафиксировать образ
+    # instance_type: mac_mini_m2
 
     environment:
       groups:
@@ -13,8 +13,8 @@ workflows:
         SCHEME: Unity-iPhone
         CHOSEN_SCHEME: Unity-iPhone
         DEVELOPMENT_TEAM: R35GJ22D76
-        PROFILE_NAME: BrightBins         # имя профиля (Profile Name), не UUID (ставим в систему на шаге импорта)
-        EXPORT_METHOD: app-store-connect  # ⚠️ новое название вместо "app-store"
+        PROFILE_NAME: BrightBins           # ИМЯ профиля (Profile Name) типа App Store
+        EXPORT_METHOD: app-store-connect    # новое имя метода
 
     scripts:
       - name: Git LFS (Unity бинарники)
@@ -34,7 +34,7 @@ workflows:
           security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_NAME"
           security list-keychains -d user -s "$KEYCHAIN_NAME" $(security list-keychains -d user | sed 's/[" ]//g')
 
-          # Сертификат (файл в секрете или base64)
+          # Сертификат (secure-файл или base64)
           CERT_FILE="cert.p12"
           if [ -n "${CERTIFICATE_P12:-}" ] && [ -f "${CERTIFICATE_P12:-/dev/null}" ]; then
             CERT_FILE="$CERTIFICATE_P12"
@@ -42,7 +42,7 @@ workflows:
             echo "$CERTIFICATE_P12" | base64 --decode > "$CERT_FILE"
           fi
 
-          # Профиль (файл в секрете или base64) — ставим в систему для экспорта
+          # Профиль (secure-файл или base64) — кладём в Profiles
           PROF_FILE="profile.mobileprovision"
           if [ -n "${MOBILEPROVISION:-}" ] && [ -f "${MOBILEPROVISION:-/dev/null}" ]; then
             PROF_FILE="$MOBILEPROVISION"
@@ -61,7 +61,7 @@ workflows:
           rm -f "$TMP_PLIST"
           cp "$PROF_FILE" "$PROFILE_DIR/$UUID.mobileprovision"
 
-      - name: Выбрать схему и найти проект (мгновенно, без list)
+      - name: Выбрать схему и найти проект (мгновенно)
         script: |
           set -euo pipefail
           CHOSEN="${SCHEME:-Unity-iPhone}"
@@ -101,6 +101,7 @@ workflows:
         script: |
           set -euo pipefail
           : "${DEVELOPMENT_TEAM:?Missing DEVELOPMENT_TEAM}"
+          : "${PROFILE_NAME:?Missing PROFILE_NAME}"
           : "${BUNDLE_ID:?Missing BUNDLE_ID}"
           : "${EXPORT_METHOD:?Missing EXPORT_METHOD}"
 
@@ -109,25 +110,17 @@ workflows:
           echo "✅ Archive will use scheme: $CHOSEN_SCHEME"
 
           if [ -n "${XCODE_WORKSPACE:-}" ]; then
-            echo "Using workspace: $XCODE_WORKSPACE"
             PROJ_ARG=(-workspace "$XCODE_WORKSPACE")
           elif [ -n "${XCODE_PROJECT:-}" ]; then
-            echo "Using project: $XCODE_PROJECT"
             PROJ_ARG=(-project "$XCODE_PROJECT")
           else
-            echo "⚠️ workspace/project не определены — повторный поиск…"
-            WS="$(find . -type d -name '*.xcworkspace' -print -quit 2>/dev/null || true)"
-            PR="$(find . -type d -name 'Unity-iPhone.xcodeproj' -print -quit 2>/dev/null || true)"
-            [ -z "$PR" ] && PR="$(find . -type d -name '*.xcodeproj' -print -quit 2>/dev/null || true)"
-            if [ -n "$WS" ]; then PROJ_ARG=(-workspace "$WS"); elif [ -n "$PR" ]; then PROJ_ARG=(-project "$PR"); else
-              echo "❌ Ни workspace, ни project не найдены"; exit 1; fi
+            echo "❌ Ни workspace, ни project не найдены"; exit 1
           fi
 
           ARCHIVE_PATH="$CM_BUILD_DIR/app.xcarchive"
 
-          # 1) Архивируем БЕЗ подписи — чтобы UnityFramework не конфликтовал
+          # 1) Архив без подписи (чтобы не конфликтовал UnityFramework)
           xcodebuild -resolvePackageDependencies "${PROJ_ARG[@]}" -scheme "$CHOSEN_SCHEME"
-
           xcodebuild archive \
             "${PROJ_ARG[@]}" \
             -scheme "$CHOSEN_SCHEME" \
@@ -139,19 +132,53 @@ workflows:
             CODE_SIGNING_REQUIRED=NO \
           | tee "$CM_BUILD_DIR/xcodebuild-archive.log"
 
-          # 2) Экспорт с АВТО подписанием (без provisioningProfiles для фреймворка)
+          # 2) Верификация: Bundle ID в архиве == ожидаемому
+          APP_BUNDLE_IN_ARCHIVE="$(/usr/libexec/PlistBuddy -c 'Print :ApplicationProperties:CFBundleIdentifier' "$ARCHIVE_PATH/Info.plist" 2>/dev/null || true)"
+          echo "Archive CFBundleIdentifier: ${APP_BUNDLE_IN_ARCHIVE:-<empty>}"
+          if [ "$APP_BUNDLE_IN_ARCHIVE" != "$BUNDLE_ID" ]; then
+            echo "❌ CFBundleIdentifier в архиве ($APP_BUNDLE_IN_ARCHIVE) != ожидаемому ($BUNDLE_ID). Проверь PRODUCT_BUNDLE_IDENTIFIER/Info.plist."; exit 1
+          fi
+
+          # 3) Верификация: найден App Store профиль 'PROFILE_NAME' для этого Bundle ID
+          PROFILE_MATCHED_PATH=""
+          for f in "$HOME/Library/MobileDevice/Provisioning Profiles/"*.mobileprovision; do
+            [ -e "$f" ] || continue
+            NAME="$(security cms -D -i "$f" | /usr/libexec/PlistBuddy -c 'Print :Name' - 2>/dev/null || true)"
+            APPID="$(security cms -D -i "$f" | /usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' - 2>/dev/null || true)"
+            if [ "$NAME" = "$PROFILE_NAME" ]; then
+              echo "Found profile '$NAME' at: $f"
+              echo "application-identifier: $APPID"
+              # Ожидаем формат TEAMID.BUNDLEID
+              EXPECTED_APPID="${DEVELOPMENT_TEAM}.${BUNDLE_ID}"
+              if [ "$APPID" != "$EXPECTED_APPID" ]; then
+                echo "❌ Профиль '$PROFILE_NAME' выпущен для '$APPID', а нужен '$EXPECTED_APPID'."; exit 1
+              fi
+              PROFILE_MATCHED_PATH="$f"
+              break
+            fi
+          done
+          if [ -z "$PROFILE_MATCHED_PATH" ]; then
+            echo "❌ Не найден установленный профиль с именем '$PROFILE_NAME' для $BUNDLE_ID. Залей верный .mobileprovision в секрет MOBILEPROVISION."; exit 1
+          fi
+
+          # 4) Экспорт с РУЧНОЙ подписью только для APP (без трогания фреймворков)
           mkdir -p "$CM_EXPORT_DIR"
-          cat > exportOptions.plist <<'EOF'
+          cat > exportOptions.plist <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
           <dict>
             <key>method</key>
-            <string>__EXPORT_METHOD__</string>
+            <string>${EXPORT_METHOD}</string>
             <key>teamID</key>
-            <string>__DEVELOPMENT_TEAM__</string>
+            <string>${DEVELOPMENT_TEAM}</string>
             <key>signingStyle</key>
-            <string>automatic</string>
+            <string>manual</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>${BUNDLE_ID}</key>
+              <string>${PROFILE_NAME}</string>
+            </dict>
             <key>destination</key>
             <string>export</string>
             <key>compileBitcode</key>
@@ -161,7 +188,6 @@ workflows:
           </dict>
           </plist>
           EOF
-          sed -i.bak "s|__EXPORT_METHOD__|$EXPORT_METHOD|g; s|__DEVELOPMENT_TEAM__|$DEVELOPMENT_TEAM|g" exportOptions.plist
 
           xcodebuild -exportArchive \
             -archivePath "$ARCHIVE_PATH" \
