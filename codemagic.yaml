@@ -1,3 +1,68 @@
+workflows:
+  ios_appstore_manual_signing:
+    name: iOS App Store (Unity Xcode, manual signing)
+    max_build_duration: 60
+    # instance_type можно указать при необходимости, но это опционально
+    # instance_type: mac_mini_m2
+
+    environment:
+      groups:
+        - signing            # CERTIFICATE_P12, CERTIFICATE_PASSWORD, MOBILEPROVISION
+        - appstore_connect   # APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY
+      vars:
+        BUNDLE_ID: io.battung.brightbins
+        SCHEME: Unity-iPhone
+        DEVELOPMENT_TEAM: R35GJ22D76
+        PROFILE_NAME: BrightBins
+        EXPORT_METHOD: app-store
+
+    scripts:
+      - name: Git LFS (Unity бинарники)
+        script: |
+          set -euo pipefail
+          git lfs install
+          git lfs fetch
+          git lfs checkout
+
+      - name: Импорт сертификата и профиля
+        script: |
+          set -euo pipefail
+
+          KEYCHAIN_NAME=codemagic.keychain
+          KEYCHAIN_PASS="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_NAME"
+          security set-keychain-settings "$KEYCHAIN_NAME"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_NAME"
+          security list-keychains -d user -s "$KEYCHAIN_NAME" $(security list-keychains -d user | sed 's/[" ]//g')
+
+          # --- Поддержка как "файл в секрете", так и base64-переменной ---
+          CERT_FILE="cert.p12"
+          if [ -f "$CERTIFICATE_P12" ]; then
+            CERT_FILE="$CERTIFICATE_P12"
+          else
+            echo "$CERTIFICATE_P12" | base64 --decode > "$CERT_FILE"
+          fi
+
+          PROF_FILE="profile.mobileprovision"
+          if [ -f "$MOBILEPROVISION" ]; then
+            PROF_FILE="$MOBILEPROVISION"
+          else
+            echo "$MOBILEPROVISION" | base64 --decode > "$PROF_FILE"
+          fi
+
+          # Импорт сертификата
+          security import "$CERT_FILE" -k "$KEYCHAIN_NAME" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security -A
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_NAME"
+
+          # Установка профиля
+          PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$PROFILE_DIR"
+          TMP_PLIST="$(mktemp -t prov.plist)"
+          security cms -D -i "$PROF_FILE" > "$TMP_PLIST"
+          UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" "$TMP_PLIST")
+          rm -f "$TMP_PLIST"
+          cp "$PROF_FILE" "$PROFILE_DIR/$UUID.mobileprovision"
+
       - name: Найти .xcodeproj/.xcworkspace и выбрать схему (надёжно)
         script: |
           set -euo pipefail
@@ -78,3 +143,98 @@
 
           echo "✅ Using scheme: $CHOSEN_SCHEME"
           echo "export CHOSEN_SCHEME=\"$CHOSEN_SCHEME\"" >> "$CM_ENV"
+
+      - name: Поднять номер сборки
+        script: |
+          set -euo pipefail
+          INFOPLIST=$(grep -rl --include="Info.plist" "<string>${BUNDLE_ID}</string>" . || true)
+          if [ -z "$INFOPLIST" ]; then
+            INFOPLIST=$(grep -rl --include="Info.plist" "<key>CFBundleIdentifier</key>" . | head -n1 || true)
+          fi
+          if [ -n "$INFOPLIST" ]; then
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $CM_BUILD_ID" "$INFOPLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $CM_BUILD_ID" "$INFOPLIST"
+          else
+            echo "⚠️ Info.plist не найден — пропускаю"
+          fi
+
+      - name: Archive and export IPA
+        script: |
+          set -euo pipefail
+          : "${DEVELOPMENT_TEAM:?Missing DEVELOPMENT_TEAM}"
+          : "${PROFILE_NAME:?Missing PROFILE_NAME}"
+          : "${BUNDLE_ID:?Missing BUNDLE_ID}"
+          : "${EXPORT_METHOD:?Missing EXPORT_METHOD}"
+          : "${CHOSEN_SCHEME:?Missing CHOSEN_SCHEME}"
+
+          if [ -n "${XCODE_WORKSPACE:-}" ]; then
+            PROJ_ARG=(-workspace "$XCODE_WORKSPACE")
+          else
+            PROJ_ARG=(-project "$XCODE_PROJECT")
+          fi
+
+          ARCHIVE_PATH="$CM_BUILD_DIR/app.xcarchive"
+
+          xcodebuild -resolvePackageDependencies "${PROJ_ARG[@]}" -scheme "$CHOSEN_SCHEME"
+
+          xcodebuild archive \
+            "${PROJ_ARG[@]}" \
+            -scheme "$CHOSEN_SCHEME" \
+            -configuration Release \
+            -archivePath "$ARCHIVE_PATH" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
+            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
+          | tee "$CM_BUILD_DIR/xcodebuild-archive.log"
+
+          mkdir -p "$CM_EXPORT_DIR"
+          cat > exportOptions.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>__EXPORT_METHOD__</string>
+            <key>teamID</key>
+            <string>__DEVELOPMENT_TEAM__</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>__BUNDLE_ID__</key>
+              <string>__PROFILE_NAME__</string>
+            </dict>
+            <key>destination</key>
+            <string>export</string>
+            <key>compileBitcode</key>
+            <false/>
+            <key>uploadBitcode</key>
+            <false/>
+          </dict>
+          </plist>
+          EOF
+          # Подставим значения, чтобы не ловить кавычки/экранирование
+          sed -i.bak "s|__EXPORT_METHOD__|$EXPORT_METHOD|g; s|__DEVELOPMENT_TEAM__|$DEVELOPMENT_TEAM|g; s|__BUNDLE_ID__|$BUNDLE_ID|g; s|__PROFILE_NAME__|$PROFILE_NAME|g" exportOptions.plist
+
+          xcodebuild -exportArchive \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportOptionsPlist exportOptions.plist \
+            -exportPath "$CM_EXPORT_DIR" \
+          | tee "$CM_BUILD_DIR/xcodebuild-export.log"
+
+    artifacts:
+      - $CM_BUILD_DIR/xcodebuild-archive.log
+      - $CM_BUILD_DIR/xcodebuild-export.log
+      - $CM_EXPORT_DIR/*.ipa
+      - $CM_EXPORT_DIR/*.dSYM.zip
+      - $CM_BUILD_DIR/*.xcarchive
+
+    publishing:
+      app_store_connect:
+        api_key: $APP_STORE_CONNECT_PRIVATE_KEY
+        key_id: $APP_STORE_CONNECT_KEY_IDENTIFIER
+        issuer_id: $APP_STORE_CONNECT_ISSUER_ID
+        submit_to_testflight: true
+        # skip_waiting_for_build_processing: true
