@@ -1,194 +1,170 @@
 workflows:
   ios_appstore_manual_signing:
-    name: iOS App Store (Unity Xcode export) — manual signing
+    name: iOS App Store (Unity Xcode, manual signing)
     max_build_duration: 60
-
+    xcode: 16.4
     environment:
       groups:
-        - signing            # CERTIFICATE_P12, CERTIFICATE_PASSWORD, MOBILEPROVISION
-        - appstore_connect   # APP_STORE_CONNECT_* 
+        - signing
+        - appstore_connect
       vars:
-        BUNDLE_ID: "io.battung.brightbins"
-        EXPORT_METHOD: "app-store"
+        # === ПОДСТАВЬ СВОЁ ПРИ НУЖДЕ ===
+        BUNDLE_ID: io.battung.brightbins
+        SCHEME: Unity-iPhone
+        DEVELOPMENT_TEAM: R35GJ22D76
+        PROFILE_NAME: BrightBins         # имя профиля (Profile Name), а НЕ UUID
+        EXPORT_METHOD: app-store
 
     scripts:
-      - name: Git LFS (Unity-бинарники)
+      - name: Git LFS (Unity бинарники)
         script: |
           set -euo pipefail
           git lfs install
           git lfs fetch
           git lfs checkout
 
-      - name: Импорт сертификата и профиля (+ экспорт переменных)
+      - name: Импорт сертификата и профиля
         script: |
           set -euo pipefail
-          set -x
-          # --- keychain ---
-          KEYCHAIN="$HOME/Library/Keychains/codemagic.keychain-db"
-          security create-keychain -p "" "$KEYCHAIN" || true
-          security set-keychain-settings -lut 21600 "$KEYCHAIN"
-          security unlock-keychain -p "" "$KEYCHAIN"
-          security list-keychains -d user -s "$KEYCHAIN" login.keychain
 
-          # --- cert ---
-          echo "$CERTIFICATE_P12" | base64 --decode > cert.p12
-          security import cert.p12 -k "$KEYCHAIN" -P "${CERTIFICATE_PASSWORD:-}" -T /usr/bin/codesign -T /usr/bin/xcodebuild
+          KEYCHAIN_NAME=codemagic.keychain
+          KEYCHAIN_PASS="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_NAME"
+          security set-keychain-settings "$KEYCHAIN_NAME"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_NAME"
+          security list-keychains -d user -s "$KEYCHAIN_NAME" $(security list-keychains -d user | sed 's/[" ]//g')
 
-          # --- provisioning profile ---
-          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
-          PROFILE_PATH="$HOME/Library/MobileDevice/Provisioning Profiles/profile.mobileprovision"
-          echo "$MOBILEPROVISION" | base64 --decode > "$PROFILE_PATH"
+          # Сертификат (твои секреты: CERTIFICATE_P12 / CERTIFICATE_PASSWORD)
+          security import "$CERTIFICATE_P12" -k "$KEYCHAIN_NAME" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security -A
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_NAME"
 
-          # Разобрать mobileprovision -> plist
-          PP_PLIST=$(mktemp)
-          security cms -D -i "$PROFILE_PATH" > "$PP_PLIST"
+          # Профиль подписи (секрет: MOBILEPROVISION)
+          PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$PROFILE_DIR"
+          TMP_PLIST="$(mktemp -t prov.plist)"
+          security cms -D -i "$MOBILEPROVISION" > "$TMP_PLIST"
+          UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" "$TMP_PLIST")
+          rm -f "$TMP_PLIST"
+          cp "$MOBILEPROVISION" "$PROFILE_DIR/$UUID.mobileprovision"
 
-          TEAM_ID=$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$PP_PLIST")
-          PROFILE_NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$PP_PLIST" || echo "")
-          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$PP_PLIST")
-          # На случай, если Name пустой — используем UUID
-          PROFILE_NAME=${PROFILE_NAME:-$PROFILE_UUID}
-
-          echo "DEVELOPMENT_TEAM=$TEAM_ID"           | tee -a "$CM_ENV"
-          echo "PROFILE_NAME=$PROFILE_NAME"          | tee -a "$CM_ENV"
-          echo "CODE_SIGN_IDENTITY=${CODE_SIGN_IDENTITY:-Apple Distribution}" | tee -a "$CM_ENV"
-          echo "PROFILE_PATH=$PROFILE_PATH"          | tee -a "$CM_ENV"
-
-      - name: Найти Xcode-проект и схему (предпочтать Unity-iPhone)
+      - name: Найти .xcodeproj/.xcworkspace и выбрать схему
         script: |
           set -euo pipefail
-          set -x
-          WS="$(find . -maxdepth 2 -name "*.xcworkspace" | head -n1 || true)"
-          PR="$(find . -maxdepth 2 -name "*.xcodeproj"   | head -n1 || true)"
+
+          WS="$(find . -maxdepth 2 -name '*.xcworkspace' | head -n1 || true)"
+          PR="$(find . -maxdepth 2 -name '*.xcodeproj'     | head -n1 || true)"
+
           if [ -n "$WS" ]; then
-            PROJ_ARG="-workspace \"$WS\""
+            echo "Using workspace: $WS"
+            LIST_ARGS=(-workspace "$WS")
+            echo "export XCODE_WORKSPACE=\"$WS\"" >> $CM_ENV
           elif [ -n "$PR" ]; then
-            PROJ_ARG="-project \"$PR\""
+            echo "Using project: $PR"
+            LIST_ARGS=(-project "$PR")
+            echo "export XCODE_PROJECT=\"$PR\"" >> $CM_ENV
           else
-            echo "❌ .xcworkspace/.xcodeproj не найден"; exit 1
+            echo "❌ Не найден .xcworkspace или .xcodeproj"; exit 1
           fi
 
-          SCHEMES="$(eval xcodebuild -list $PROJ_ARG | sed -n '/Schemes:/,/^$/p' | sed '1d;$d' | xargs -L1 echo || true)"
-          if echo "$SCHEMES" | grep -qx "Unity-iPhone"; then
-            SCHEME="Unity-iPhone"
+          # Если указал SCHEME и она есть — берём её, иначе первая из списка
+          if [ -n "${SCHEME:-}" ] && xcodebuild -list "${LIST_ARGS[@]}" | grep -q "$SCHEME"; then
+            CHOSEN_SCHEME="$SCHEME"
           else
-            SCHEME="$(echo "$SCHEMES" | grep -v "^GameAssembly$" | head -n1 || echo Unity-iPhone)"
+            CHOSEN_SCHEME="$(xcodebuild -list "${LIST_ARGS[@]}" | sed -n '/Schemes:/,/^$/p' | sed '1d;$d' | head -n1 | xargs || true)"
           fi
 
-          echo "PROJ_ARG=$PROJ_ARG" | tee -a "$CM_ENV"
-          echo "SCHEME=$SCHEME"     | tee -a "$CM_ENV"
+          if [ -z "$CHOSEN_SCHEME" ]; then
+            echo "❌ Не удалось определить схему"; exit 1
+          fi
 
-      - name: Проверка наличия IL2CPP toolchain в репо
+          echo "Using scheme: $CHOSEN_SCHEME"
+          echo "export CHOSEN_SCHEME=\"$CHOSEN_SCHEME\"" >> $CM_ENV
+
+      - name: Поднять номер сборки
         script: |
           set -euo pipefail
-          ROOT="$(pwd)"
-          DEPLOY_DIR_1="$ROOT/Il2CppOutputProject/IL2CPP/build/deploy_arm64"
-          DEPLOY_DIR_2="$ROOT/Il2CppOutputProject/IL2CPP/build/deploy"
-          BEE_1="$DEPLOY_DIR_1/bee_backend/mac-arm64/bee_backend"
-          BEE_2="$DEPLOY_DIR_2/bee_backend/mac-arm64/bee_backend"
-          IL2CPP_1="$DEPLOY_DIR_1/il2cpp"
-          IL2CPP_2="$DEPLOY_DIR_2/il2cpp"
-
-          find Il2CppOutputProject -maxdepth 3 -type d -name "deploy*" -print || true
-
-          if [ -x "$IL2CPP_1" ] && [ -x "$BEE_1" ]; then
-            echo "OK: найдено $DEPLOY_DIR_1"
-          elif [ -x "$IL2CPP_2" ] && [ -x "$BEE_2" ]; then
-            echo "OK: найдено $DEPLOY_DIR_2"
+          # Находим Info.plist с твоим bundle id
+          INFOPLIST=$(grep -rl --include="Info.plist" "<string>${BUNDLE_ID}</string>" . || true)
+          if [ -z "$INFOPLIST" ]; then
+            INFOPLIST=$(grep -rl --include="Info.plist" "<key>CFBundleIdentifier</key>" . | head -n1 || true)
+          fi
+          if [ -n "$INFOPLIST" ]; then
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $CM_BUILD_ID" "$INFOPLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $CM_BUILD_ID" "$INFOPLIST"
           else
-            echo "❌ Il2CPP/bee не в репозитории. Добавь Il2CppOutputProject/IL2CPP/build/** под LFS."; exit 65
+            echo "⚠️ Info.plist не найден — пропускаю"
           fi
-
-      - name: Подготовка версий (Info.plist)
-        script: |
-          set -euo pipefail
-          set -x
-          PLIST="$(find . -maxdepth 2 -name Info.plist | head -n1 || true)"
-          if [ -z "$PLIST" ]; then echo "Пропускаю: Info.plist не найден"; exit 0; fi
-          # Если переменные не заданы — ничего не меняем
-          if [ -n "${APP_VERSION:-}" ]; then
-            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "$PLIST" || \
-            /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $APP_VERSION" "$PLIST"
-          fi
-          if [ -n "${APP_BUILD:-}" ]; then
-            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $APP_BUILD" "$PLIST" || \
-            /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $APP_BUILD" "$PLIST"
-          fi
-          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$PLIST" || true
 
       - name: Archive and export IPA
         script: |
           set -euo pipefail
-          set -x
+          : "${DEVELOPMENT_TEAM:?Missing DEVELOPMENT_TEAM}"
+          : "${PROFILE_NAME:?Missing PROFILE_NAME}"
+          : "${BUNDLE_ID:?Missing BUNDLE_ID}"
+          : "${EXPORT_METHOD:?Missing EXPORT_METHOD}"
+          : "${CHOSEN_SCHEME:?Missing CHOSEN_SCHEME}"
 
-          # Fallbackы (если шаг выше по какой-то причине не записал переменные)
-          if [ -z "${PROJ_ARG:-}" ]; then
-            WS="$(find . -maxdepth 2 -name "*.xcworkspace" | head -n1 || true)"
-            PR="$(find . -maxdepth 2 -name "*.xcodeproj"   | head -n1 || true)"
-            [ -n "$WS" ] && PROJ_ARG="-workspace \"$WS\"" || PROJ_ARG="-project \"$PR\""
+          # Сформируем аргумент проекта/воркспейса безопасно
+          if [ -n "${XCODE_WORKSPACE:-}" ]; then
+            PROJ_ARG=(-workspace "$XCODE_WORKSPACE")
+          else
+            PROJ_ARG=(-project "$XCODE_PROJECT")
           fi
 
-          if [ -z "${SCHEME:-}" ]; then
-            DETECTED="$(eval xcodebuild -list $PROJ_ARG | sed -n '/Schemes:/,/^$/p' | sed '1d;$d' | xargs -L1 echo | { grep -x "Unity-iPhone" || true; } )"
-            SCHEME="${DETECTED:-Unity-iPhone}"
-          fi
+          ARCHIVE_PATH="$CM_BUILD_DIR/app.xcarchive"
 
-          # Подхватить team/profile из профиля, если их нет
-          if [ -z "${DEVELOPMENT_TEAM:-}" ] || [ -z "${PROFILE_NAME:-}" ]; then
-            if [ -n "${PROFILE_PATH:-}" ]; then
-              PP_PLIST=$(mktemp); security cms -D -i "$PROFILE_PATH" > "$PP_PLIST"
-              DEVELOPMENT_TEAM="${DEVELOPMENT_TEAM:-$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$PP_PLIST")}"
-              PROFILE_NAME="${PROFILE_NAME:-$(/usr/libexec/PlistBuddy -c 'Print :Name' "$PP_PLIST" || /usr/libexec/PlistBuddy -c 'Print :UUID' "$PP_PLIST")}"
-            fi
-          fi
+          # SPM зависимости (если есть)
+          xcodebuild -resolvePackageDependencies "${PROJ_ARG[@]}" -scheme "$CHOSEN_SCHEME"
 
-          CODE_SIGN_IDENTITY=${CODE_SIGN_IDENTITY// /\\ } \:-Apple Distribution}"
-
-          ARCHIVE_PATH="$CM_BUILD_DIR/$SCHEME.xcarchive"
-
-          # На всякий — SPM
-          eval xcodebuild -resolvePackageDependencies $PROJ_ARG -scheme "$SCHEME" || true
-
-          # Архив
-          eval xcodebuild archive $PROJ_ARG \
-            -scheme "$SCHEME" \
+          # Архивирование (внимание: никакого экранирования 'Distribution' — просто в кавычках)
+          xcodebuild archive \
+            "${PROJ_ARG[@]}" \
+            -scheme "$CHOSEN_SCHEME" \
             -configuration Release \
             -archivePath "$ARCHIVE_PATH" \
             CODE_SIGN_STYLE=Manual \
-            DEVELOPMENT_TEAM="${DEVELOPMENT_TEAM:-}" \
-            PROVISIONING_PROFILE_SPECIFIER="${PROFILE_NAME:-}" \
+            DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
             PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
-            CODE_SIGN_IDENTITY="$CODE_SIGN_IDENTITY" \
-            | tee "$CM_BUILD_DIR/xcodebuild-archive.log"
+            CODE_SIGN_IDENTITY="Apple Distribution" \
+          | tee "$CM_BUILD_DIR/xcodebuild-archive.log"
 
-          # exportOptions.plist
+          mkdir -p "$CM_EXPORT_DIR"
           cat > exportOptions.plist <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0"><dict>
-            <key>method</key><string>${EXPORT_METHOD}</string>
-            <key>teamID</key><string>${DEVELOPMENT_TEAM}</string>
-            <key>signingStyle</key><string>manual</string>
-            <key>provisioningProfiles</key><dict>
-              <key>${BUNDLE_ID}</key><string>${PROFILE_NAME}</string>
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>${EXPORT_METHOD}</string>
+            <key>teamID</key>
+            <string>${DEVELOPMENT_TEAM}</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>${BUNDLE_ID}</key>
+              <string>${PROFILE_NAME}</string>
             </dict>
-            <key>destination</key><string>export</string>
-            <key>compileBitcode</key><false/>
-            <key>stripSwiftSymbols</key><true/>
-            <key>manageAppVersionAndBuildNumber</key><false/>
-          </dict></plist>
+            <key>destination</key>
+            <string>export</string>
+            <key>compileBitcode</key>
+            <false/>
+            <key>uploadBitcode</key>
+            <false/>
+          </dict>
+          </plist>
           EOF
 
-          # Экспорт IPA
           xcodebuild -exportArchive \
             -archivePath "$ARCHIVE_PATH" \
             -exportOptionsPlist exportOptions.plist \
-            -exportPath "$CM_EXPORT_DIR"
-
-          ls -lah "$CM_EXPORT_DIR"
+            -exportPath "$CM_EXPORT_DIR" \
+          | tee "$CM_BUILD_DIR/xcodebuild-export.log"
 
     artifacts:
       - $CM_BUILD_DIR/xcodebuild-archive.log
+      - $CM_BUILD_DIR/xcodebuild-export.log
       - $CM_EXPORT_DIR/*.ipa
       - $CM_EXPORT_DIR/*.dSYM.zip
       - $CM_BUILD_DIR/*.xcarchive
@@ -199,3 +175,4 @@ workflows:
         key_id: $APP_STORE_CONNECT_KEY_IDENTIFIER
         issuer_id: $APP_STORE_CONNECT_ISSUER_ID
         submit_to_testflight: true
+        # skip_waiting_for_build_processing: true
