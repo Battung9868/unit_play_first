@@ -134,10 +134,31 @@ workflows:
             echo "Info.plist не найден — пропускаю смену версий."
           fi
 
-      - name: Archive and export IPA
+          - name: Archive and export IPA
         script: |
           set -euo pipefail
           set -x
+
+          # --- Fallback: если из предыдущего шага не пришли PROJ_ARG/SCHEME ---
+          if [ -z "${PROJ_ARG:-}" ]; then
+            WS="$(find . -maxdepth 2 -name "*.xcworkspace" | head -n1 || true)"
+            PR="$(find . -maxdepth 2 -name "*.xcodeproj"   | head -n1 || true)"
+            if [ -n "$WS" ]; then
+              PROJ_ARG="-workspace \"$WS\""
+            elif [ -n "$PR" ]; then
+              PROJ_ARG="-project \"$PR\""
+            else
+              echo "❌ Не найден .xcworkspace/.xcodeproj в репозитории"; exit 1
+            fi
+            echo "Detected PROJ_ARG: $PROJ_ARG"
+          fi
+
+          if [ -z "${SCHEME:-}" ]; then
+            DETECTED="$(eval xcodebuild -list $PROJ_ARG | sed -n '/Schemes:/,/^$/p' | sed '1d;$d' | head -n1 | xargs || true)"
+            SCHEME="${DETECTED:-Unity-iPhone}"
+            echo "Detected scheme: $SCHEME"
+          fi
+          # -------------------------------------------------------------------
 
           # На всякий — решить зависимости SPM (если есть)
           eval xcodebuild -resolvePackageDependencies $PROJ_ARG -scheme "$SCHEME" || true
@@ -160,21 +181,18 @@ workflows:
           cat > exportOptions.plist <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
+          <plist version="1.0"><dict>
             <key>method</key><string>${EXPORT_METHOD}</string>
             <key>teamID</key><string>${DEVELOPMENT_TEAM}</string>
             <key>signingStyle</key><string>manual</string>
-            <key>provisioningProfiles</key>
-            <dict>
+            <key>provisioningProfiles</key><dict>
               <key>${BUNDLE_ID}</key><string>${PROFILE_NAME}</string>
             </dict>
             <key>destination</key><string>export</string>
             <key>compileBitcode</key><false/>
             <key>stripSwiftSymbols</key><true/>
             <key>manageAppVersionAndBuildNumber</key><false/>
-          </dict>
-          </plist>
+          </dict></plist>
           EOF
 
           # Экспорт IPA
