@@ -5,17 +5,17 @@ workflows:
 
     environment:
       groups:
-        - signing            # CERTIFICATE_P12 (base64 или путь), CERTIFICATE_PASSWORD, MOBILEPROVISION (base64 или путь)
+        - signing            # CERTIFICATE_P12 (base64/путь), CERTIFICATE_PASSWORD, MOBILEPROVISION (base64/путь)
         - appstore_connect   # APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY
       vars:
         BUNDLE_ID: io.battung.brightbins
         DEVELOPMENT_TEAM: R35GJ22D76
         SCHEME: Unity-iPhone
         XCODE_PROJECT: "Unity-iPhone.xcodeproj"
-        EXPORT_METHOD: app-store-connect   # для Xcode 16+
+        EXPORT_METHOD: app-store-connect   # Xcode 16+
 
     scripts:
-      # --- Если LFS нужен и квота есть, оставь. Если нет — закомментируй этот шаг. ---
+      # Если у тебя нет LFS-квоты — закомментируй этот шаг
       - name: "Git LFS (Unity бинарники)"
         script: |
           set -euo pipefail
@@ -47,7 +47,7 @@ workflows:
           fi
           security import "$CERT_FILE" -k "$KEYCHAIN_NAME" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security -A
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_NAME"
-          echo "== Codesign identities in keychain =="
+          echo "== Codesign identities =="
           security find-identity -v -p codesigning "$KEYCHAIN_NAME" || true
 
           # --- Профиль (.mobileprovision) ---
@@ -77,12 +77,11 @@ workflows:
           echo "application-identifier=$APP_IDENTIFIER"
           echo "get-task-allow=$GET_TASK_ALLOW"
 
-          # Жёсткая проверка профиля
           [[ "$GET_TASK_ALLOW" == "false" ]] || { echo "❌ Нужен App Store Distribution профиль"; exit 1; }
           EXPECTED_AI="${DEVELOPMENT_TEAM}.${BUNDLE_ID}"
           [[ "$APP_IDENTIFIER" == "$EXPECTED_AI" ]] || { echo "❌ Профиль не под $BUNDLE_ID (ожидали $EXPECTED_AI)"; exit 1; }
 
-          # Экспортируем в окружение
+          # В окружение
           echo "PROFILE_UUID=$PROFILE_UUID" >> "$CM_ENV"
           echo "PROFILE_NAME=$PROFILE_NAME_DETECTED" >> "$CM_ENV"
           echo "KEYCHAIN_NAME=$KEYCHAIN_NAME" >> "$CM_ENV"
@@ -94,15 +93,15 @@ workflows:
           test -d "$XCODE_PROJECT" || { echo "ERROR: не найден проект: $XCODE_PROJECT"; exit 1; }
           echo "OK: проект найден: $XCODE_PROJECT"
 
-      # --- Полная чистка Manual-профилей из проекта (включая UnityFramework) ---
+      # Полная чистка Manual-профилей в проекте (включая UnityFramework)
       - name: "Clear manual provisioning from pbxproj"
         script: |
           set -euo pipefail
           PBX="$XCODE_PROJECT/project.pbxproj"
           cp "$PBX" "$PBX.bak" || true
-          # Удалить все PROVISIONING_PROFILE/PROVISIONING_PROFILE_SPECIFIER (включая sdk-спецификаторы)
+          # Удаляем любые PROVISIONING_PROFILE/PROVISIONING_PROFILE_SPECIFIER (включая sdk-override)
           sed -i '' -E 's/PROVISIONING_PROFILE(_SPECIFIER)?(\[sdk=[^]]+\])?[[:space:]]*=[[:space:]]*[^;]+;//g' "$PBX"
-          # Manual -> Automatic (включая sdk-спецификаторы)
+          # Manual -> Automatic
           sed -i '' -E 's/CODE_SIGN_STYLE(\[sdk=[^]]+\])?[[:space:]]*=[[:space:]]*Manual;/CODE_SIGN_STYLE\1 = Automatic;/g' "$PBX"
 
       - name: "Verify no manual provisioning left"
@@ -110,15 +109,14 @@ workflows:
           set -euo pipefail
           PBX="$XCODE_PROJECT/project.pbxproj"
           if grep -nE 'PROVISIONING_PROFILE(_SPECIFIER)?[[:space:]]*=' "$PBX"; then
-            echo "❌ Нашлись ручные профили в pbxproj — чистка не сработала"; exit 1
+            echo "❌ Нашлись ручные профили в pbxproj"; exit 1
           fi
           echo "OK: PROVISIONING_PROFILE* не найден"
 
-      - name: "Archive (codesign off)"
+      - name: "Archive (codesign OFF)"
         script: |
           set -euo pipefail
           source "$CM_ENV" || true
-
           CHOSEN_SCHEME="${SCHEME:-Unity-iPhone}"
           ARCHIVE_PATH="$CM_BUILD_DIR/app.xcarchive"
 
@@ -143,6 +141,30 @@ workflows:
             /usr/libexec/PlistBuddy -c "Print ApplicationProperties:CFBundleIdentifier" "$ARCHIVE_PATH/Info.plist" || true
           fi
 
+      # Патчим CFBundleIdentifier UnityFramework внутри архива (если совпадает с app)
+      - name: "Patch UnityFramework CFBundleIdentifier inside archive"
+        script: |
+          set -euo pipefail
+          source "$CM_ENV" || true
+          ARCHIVE_PATH="$CM_BUILD_DIR/app.xcarchive"
+          APP_PATH="$(ls -d "$ARCHIVE_PATH/Products/Applications"/*.app | head -n1 || true)"
+          if [[ -z "$APP_PATH" ]]; then
+            echo "❌ Не найден .app в архиве"; exit 1
+          fi
+          FR_PLIST="$APP_PATH/Frameworks/UnityFramework.framework/Info.plist"
+          if [[ -f "$FR_PLIST" ]]; then
+            UF_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$FR_PLIST" 2>/dev/null || echo "")
+            echo "UnityFramework CFBundleIdentifier (before): $UF_ID"
+            if [[ "$UF_ID" == "$BUNDLE_ID" || "$UF_ID" == "" ]]; then
+              /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID.uf" "$FR_PLIST"
+              echo "UnityFramework CFBundleIdentifier (after): $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$FR_PLIST")"
+            else
+              echo "UnityFramework CFBundleIdentifier отличается от app — ок."
+            fi
+          else
+            echo "⚠️ UnityFramework Info.plist не найден — продолжаю."
+          fi
+
       - name: "Export IPA (Automatic → fallback Manual)"
         script: |
           set -euo pipefail
@@ -156,7 +178,7 @@ workflows:
           CM_EXPORT_DIR="${CM_EXPORT_DIR:-$CM_BUILD_DIR/Export}"
           mkdir -p "$CM_EXPORT_DIR"
 
-          # --- Попытка 1: AUTOMATIC (без provisioningProfiles вообще) ---
+          # Попытка 1: AUTOMATIC (без provisioningProfiles)
           AUTO_PLIST="$CM_BUILD_DIR/exportOptions_auto.plist"
           /usr/libexec/PlistBuddy -c "Clear dict" "$AUTO_PLIST" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Add :method string $EXPORT_METHOD" "$AUTO_PLIST"
@@ -190,6 +212,7 @@ workflows:
             /usr/libexec/PlistBuddy -c "Add :compileBitcode bool false" "$MANUAL_PLIST"
             /usr/libexec/PlistBuddy -c "Add :uploadBitcode bool false" "$MANUAL_PLIST"
             /usr/libexec/PlistBuddy -c "Add :provisioningProfiles dict" "$MANUAL_PLIST"
+            # Маппим ТОЛЬКО главное приложение, по UUID профиля
             /usr/libexec/PlistBuddy -c "Add :provisioningProfiles:$BUNDLE_ID string ${PROFILE_UUID}" "$MANUAL_PLIST"
 
             set +e
