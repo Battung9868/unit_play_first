@@ -6,27 +6,29 @@ workflows:
 
     environment:
       groups:
-        - signing            # CERTIFICATE_P12, CERTIFICATE_PASSWORD, MOBILEPROVISION
+        - signing            # CERTIFICATE_P12 (base64 или путь), CERTIFICATE_PASSWORD, MOBILEPROVISION (base64 или путь)
         - appstore_connect   # APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY
       vars:
         BUNDLE_ID: io.battung.brightbins
         DEVELOPMENT_TEAM: R35GJ22D76
         SCHEME: Unity-iPhone
-        XCODE_PROJECT: "Unity-iPhone.xcodeproj"     # у тебя .xcodeproj в корне
-        PROFILE_NAME: BrightBins                    # имя профиля ИЗ Dev Portal (НЕ UUID)
-        EXPORT_METHOD: app-store-connect            # новое имя метода
+        XCODE_PROJECT: "Unity-iPhone.xcodeproj"     # .xcodeproj в корне
+        # EXPORT_METHOD: app-store                   # максимально совместимо
+        EXPORT_METHOD: app-store-connect             # поддерживается в Xcode 16+
 
     scripts:
       - name: "Git LFS (Unity бинарники)"
         script: |
-          set -eu
+          set -euo pipefail
           git lfs install
           git lfs fetch
           git lfs checkout
 
       - name: "Импорт сертификата и профиля"
         script: |
-          set -eu
+          set -euo pipefail
+
+          # --- Keychain ---
           KEYCHAIN_NAME=codemagic.keychain
           KEYCHAIN_PASS="$(uuidgen)"
           security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_NAME"
@@ -35,23 +37,39 @@ workflows:
           security list-keychains -d user -s "$KEYCHAIN_NAME"
           security default-keychain -s "$KEYCHAIN_NAME"
 
-          # Сертификат (путь или base64)
+          # --- Сертификат (base64 или путь) ---
+          : "${CERTIFICATE_PASSWORD:?Missing CERTIFICATE_PASSWORD}"
           CERT_FILE="cert.p12"
-          if [ -n "${CERTIFICATE_P12:-}" ] && [ -f "${CERTIFICATE_P12:-/dev/null}" ]; then
-            CERT_FILE="$CERTIFICATE_P12"
+
+          if [[ -n "${CERTIFICATE_P12:-}" ]]; then
+            if [[ -f "${CERTIFICATE_P12}" ]]; then
+              echo "Using CERTIFICATE_P12 as file path"
+              CERT_FILE="${CERTIFICATE_P12}"
+            else
+              echo "Decoding CERTIFICATE_P12 from base64 → cert.p12"
+              printf "%s" "$CERTIFICATE_P12" | base64 --decode > "$CERT_FILE"
+            fi
           else
-            printf "%s" "$CERTIFICATE_P12" | base64 --decode > "$CERT_FILE"
+            echo "❌ CERTIFICATE_P12 not provided"; exit 1
           fi
+
           security import "$CERT_FILE" -k "$KEYCHAIN_NAME" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security -A
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_NAME"
+          echo "Available identities in keychain:"
           security find-identity -v -p codesigning "$KEYCHAIN_NAME" || true
 
-          # Профиль (путь или base64) → кладём в систему
+          # --- Профиль (base64 или путь) ---
           PROF_FILE="profile.mobileprovision"
-          if [ -n "${MOBILEPROVISION:-}" ] && [ -f "${MOBILEPROVISION:-/dev/null}" ]; then
-            PROF_FILE="$MOBILEPROVISION"
+          if [[ -n "${MOBILEPROVISION:-}" ]]; then
+            if [[ -f "${MOBILEPROVISION}" ]]; then
+              echo "Using MOBILEPROVISION as file path"
+              PROF_FILE="${MOBILEPROVISION}"
+            else
+              echo "Decoding MOBILEPROVISION from base64 → profile.mobileprovision"
+              printf "%s" "$MOBILEPROVISION" | base64 --decode > "$PROF_FILE"
+            fi
           else
-            printf "%s" "$MOBILEPROVISION" | base64 --decode > "$PROF_FILE"
+            echo "❌ MOBILEPROVISION not provided"; exit 1
           fi
 
           PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
@@ -61,36 +79,41 @@ workflows:
           security cms -D -i "$PROF_FILE" > "$TMP_PLIST"
 
           PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" "$TMP_PLIST")
-          PROFILE_NAME_DETECTED=$(/usr/libexec/PlistBuddy -c "Print Name" "$TMP_PLIST" 2>/dev/null || true)
+          PROFILE_NAME_DETECTED=$(/usr/libexec/PlistBuddy -c "Print Name" "$TMP_PLIST" 2>/dev/null || echo "")
           APP_IDENTIFIER=$(/usr/libexec/PlistBuddy -c "Print Entitlements:application-identifier" "$TMP_PLIST" 2>/dev/null || echo "")
           GET_TASK_ALLOW=$(/usr/libexec/PlistBuddy -c "Print Entitlements:get-task-allow" "$TMP_PLIST" 2>/dev/null || echo "nil")
 
           cp "$PROF_FILE" "$PROFILE_DIR/$PROFILE_UUID.mobileprovision"
 
-          echo "export PROFILE_UUID=\"$PROFILE_UUID\"" >> "$CM_ENV"
-          echo "export PROFILE_NAME=\"${PROFILE_NAME:-$PROFILE_NAME_DETECTED}\"" >> "$CM_ENV"
+          # Экспортируем в окружение для следующих шагов
+          echo "export PROFILE_UUID="$PROFILE_UUID"" >> "$CM_ENV"
+          echo "export PROFILE_NAME="${PROFILE_NAME:-$PROFILE_NAME_DETECTED}"" >> "$CM_ENV"
 
           echo "PROFILE_UUID=$PROFILE_UUID"
           echo "PROFILE_NAME=${PROFILE_NAME:-$PROFILE_NAME_DETECTED}"
           echo "application-identifier=$APP_IDENTIFIER"
-          echo "get-task-allow=$GET_TASK_ALLOW"
+          echo "get-task-allow=$GET_TASK_ALLOW (для App Store должно быть false)"
+
+          if [[ "$GET_TASK_ALLOW" != "false" ]]; then
+            echo "❌ Похоже, профиль не App Store Distribution. Нужен профиль с get-task-allow=false."
+            exit 1
+          fi
 
       - name: "Sanity: .xcodeproj exists"
         script: |
-          set -eu
+          set -euo pipefail
           test -d "$XCODE_PROJECT" || { echo "ERROR: не найден проект: $XCODE_PROJECT"; exit 1; }
           echo "OK: проект найден: $XCODE_PROJECT"
 
       - name: "Поднять номер сборки (CFBundleVersion)"
         script: |
-          set -eu
+          set -euo pipefail
           INFOPLIST="$(grep -rl --include="Info.plist" "<string>${BUNDLE_ID}</string>" . || true)"
-          if [ -z "$INFOPLIST" ]; then
+          if [[ -z "$INFOPLIST" ]]; then
             INFOPLIST="$(grep -rl --include="Info.plist" "<key>CFBundleIdentifier</key>" . | head -n1 || true)"
           fi
-          if [ -n "$INFOPLIST" ]; then
-            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $CM_BUILD_ID" "$INFOPLIST" 2>/dev/null || \
-            /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $CM_BUILD_ID" "$INFOPLIST"
+          if [[ -n "$INFOPLIST" ]]; then
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $CM_BUILD_ID" "$INFOPLIST" 2>/dev/null ||             /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $CM_BUILD_ID" "$INFOPLIST"
             echo "CFBundleVersion => $CM_BUILD_ID"
           else
             echo "WARNING: Info.plist не найден — пропускаю"
@@ -98,11 +121,10 @@ workflows:
 
       - name: "Archive and export IPA (auto → manual)"
         script: |
-          set -eu
+          set -euo pipefail
           : "${DEVELOPMENT_TEAM:?Missing DEVELOPMENT_TEAM}"
           : "${BUNDLE_ID:?Missing BUNDLE_ID}"
           : "${EXPORT_METHOD:?Missing EXPORT_METHOD}"
-          : "${PROFILE_NAME:?Missing PROFILE_NAME}"
           : "${XCODE_PROJECT:?Missing XCODE_PROJECT}"
 
           CHOSEN_SCHEME="${SCHEME:-Unity-iPhone}"
@@ -112,106 +134,86 @@ workflows:
           CM_EXPORT_DIR="${CM_EXPORT_DIR:-$CM_BUILD_DIR/Export}"
           mkdir -p "$CM_EXPORT_DIR"
 
+          # Проверим, что импорт профиля сохранил переменные
+          PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+          if [[ -z "${PROFILE_UUID:-}" ]]; then
+            echo "❌ PROFILE_UUID не найден. Проверь шаг 'Импорт сертификата и профиля'."
+            exit 1
+          fi
+
+          PROF_PLIST="$(mktemp -t prof.plist)"
+          security cms -D -i "$PROFILE_DIR/$PROFILE_UUID.mobileprovision" > "$PROF_PLIST"
+          PROFILE_NAME_DETECTED=$(/usr/libexec/PlistBuddy -c "Print Name" "$PROF_PLIST")
+          GET_TASK_ALLOW=$(/usr/libexec/PlistBuddy -c "Print Entitlements:get-task-allow" "$PROF_PLIST" 2>/dev/null || echo "nil")
+          echo "Using profile: ${PROFILE_NAME:-$PROFILE_NAME_DETECTED} | get-task-allow=$GET_TASK_ALLOW"
+
+          if [[ "$GET_TASK_ALLOW" != "false" ]]; then
+            echo "❌ Нужен App Store (Distribution) профиль. Сейчас не он."
+            exit 1
+          fi
+
           # 1) Архив без подписи
           xcodebuild -resolvePackageDependencies -project "$XCODE_PROJECT" -scheme "$CHOSEN_SCHEME"
-          xcodebuild archive \
-            -project "$XCODE_PROJECT" \
-            -scheme "$CHOSEN_SCHEME" \
-            -configuration Release \
-            -archivePath "$ARCHIVE_PATH" \
-            DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" \
-            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-          | tee "$CM_BUILD_DIR/xcodebuild-archive.log"
+          xcodebuild archive             -project "$XCODE_PROJECT"             -scheme "$CHOSEN_SCHEME"             -configuration Release             -archivePath "$ARCHIVE_PATH"             DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM"             PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID"             CODE_SIGNING_ALLOWED=NO             CODE_SIGNING_REQUIRED=NO           | tee "$CM_BUILD_DIR/xcodebuild-archive.log"
 
-          # Диагностика: какой bundle id реально лежит в архиве
-          if [ -f "$ARCHIVE_PATH/Info.plist" ]; then
+          # Для отладки: bundle id в архиве
+          if [[ -f "$ARCHIVE_PATH/Info.plist" ]]; then
+            echo "Archive bundle id:"
             /usr/libexec/PlistBuddy -c "Print ApplicationProperties:CFBundleIdentifier" "$ARCHIVE_PATH/Info.plist" || true
           fi
 
-          # 2) Экспорт с АВТО-подписанием
-          cat > exportOptions_auto.plist <<'EOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>method</key>
-            <string>__METHOD__</string>
-            <key>teamID</key>
-            <string>__TEAM__</string>
-            <key>signingStyle</key>
-            <string>automatic</string>
-            <key>destination</key>
-            <string>export</string>
-            <key>compileBitcode</key>
-            <false/>
-            <key>uploadBitcode</key>
-            <false/>
-          </dict>
-          </plist>
-          EOF
-          sed -i.bak "s|__METHOD__|$EXPORT_METHOD|; s|__TEAM__|$DEVELOPMENT_TEAM|" exportOptions_auto.plist
+          # 2) Автоподпись сначала
+          cat > export_auto.json <<JSON
+          {
+            "method": "${EXPORT_METHOD}",
+            "teamID": "${DEVELOPMENT_TEAM}",
+            "signingStyle": "automatic",
+            "destination": "export",
+            "compileBitcode": false,
+            "uploadBitcode": false
+          }
+          JSON
+          plutil -convert xml1 -o exportOptions_auto.plist export_auto.json
 
           set +e
-          xcodebuild -exportArchive \
-            -archivePath "$ARCHIVE_PATH" \
-            -exportOptionsPlist exportOptions_auto.plist \
-            -exportPath "$CM_EXPORT_DIR" \
-          | tee "$CM_BUILD_DIR/xcodebuild-export.log"
+          xcodebuild -exportArchive             -archivePath "$ARCHIVE_PATH"             -exportOptionsPlist exportOptions_auto.plist             -exportPath "$CM_EXPORT_DIR"           | tee "$CM_BUILD_DIR/xcodebuild-export.log"
           XCB_RET=$?
           set -e
 
           IPA_PATH="$(find "$CM_EXPORT_DIR" -name '*.ipa' -print -quit || true)"
-          if [ "$XCB_RET" -ne 0 ] || [ -z "$IPA_PATH" ]; then
+          if [[ "$XCB_RET" -ne 0 || -z "$IPA_PATH" ]]; then
             echo "Auto export failed or no IPA. Trying MANUAL for app bundle only…"
 
-            # 3) MANUAL-подписание ТОЛЬКО для основного bundle id
-            #   ВАЖНО: без signingCertificate, чтобы фреймворки не требовали профиль
-            cat > exportOptions_manual.plist <<EOF
-            <?xml version="1.0" encoding="UTF-8"?>
-            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-            <plist version="1.0">
-            <dict>
-              <key>method</key>
-              <string>${EXPORT_METHOD}</string>
-              <key>teamID</key>
-              <string>${DEVELOPMENT_TEAM}</string>
-              <key>signingStyle</key>
-              <string>manual</string>
-              <key>provisioningProfiles</key>
-              <dict>
-                <key>${BUNDLE_ID}</key>
-                <string>${PROFILE_NAME}</string>
-              </dict>
-              <key>destination</key>
-              <string>export</string>
-              <key>compileBitcode</key>
-              <false/>
-              <key>uploadBitcode</key>
-              <false/>
-            </dict>
-            </plist>
-            EOF
+            # 3) Ручная подпись только для основного bundle id
+            cat > export_manual.json <<JSON
+            {
+              "method": "${EXPORT_METHOD}",
+              "teamID": "${DEVELOPMENT_TEAM}",
+              "signingStyle": "manual",
+              "provisioningProfiles": {
+                "${BUNDLE_ID}": "${PROFILE_NAME:-$PROFILE_NAME_DETECTED}"
+              },
+              "destination": "export",
+              "compileBitcode": false,
+              "uploadBitcode": false
+            }
+            JSON
+            plutil -convert xml1 -o exportOptions_manual.plist export_manual.json
 
             set +e
-            xcodebuild -exportArchive \
-              -archivePath "$ARCHIVE_PATH" \
-              -exportOptionsPlist exportOptions_manual.plist \
-              -exportPath "$CM_EXPORT_DIR" \
-            | tee -a "$CM_BUILD_DIR/xcodebuild-export.log"
+            xcodebuild -exportArchive               -archivePath "$ARCHIVE_PATH"               -exportOptionsPlist exportOptions_manual.plist               -exportPath "$CM_EXPORT_DIR"             | tee -a "$CM_BUILD_DIR/xcodebuild-export.log"
             XCB_RET=$?
             set -e
 
             IPA_PATH="$(find "$CM_EXPORT_DIR" -name '*.ipa' -print -quit || true)"
-            if [ "$XCB_RET" -ne 0 ] || [ -z "$IPA_PATH" ]; then
-              echo "ERROR: IPA не создана. Хвост лога экспорта:"
+            if [[ "$XCB_RET" -ne 0 || -z "$IPA_PATH" ]]; then
+              echo "❌ IPA не создана. Хвост лога экспорта:"
               tail -n 200 "$CM_BUILD_DIR/xcodebuild-export.log" || true
               exit 1
             fi
           fi
 
-          echo "IPA created: $IPA_PATH"
+          echo "✅ IPA created: $IPA_PATH"
           echo "Export dir content:"
           find "$CM_EXPORT_DIR" -maxdepth 2 -type f -print || true
 
