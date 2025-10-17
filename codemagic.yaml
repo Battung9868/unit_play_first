@@ -12,7 +12,7 @@ workflows:
         BUNDLE_ID: io.battung.brightbins
         DEVELOPMENT_TEAM: R35GJ22D76
         SCHEME: Unity-iPhone
-        XCODE_PROJECT: "Unity-iPhone.xcodeproj"     # .xcodeproj в корне
+        XCODE_PROJECT: "Unity-iPhone.xcodeproj"
         # EXPORT_METHOD: app-store                   # максимально совместимо
         EXPORT_METHOD: app-store-connect             # поддерживается в Xcode 16+
 
@@ -85,7 +85,9 @@ workflows:
 
           cp "$PROF_FILE" "$PROFILE_DIR/$PROFILE_UUID.mobileprovision"
 
-          # Экспортируем в окружение для следующих шагов
+          # Экспортируем в окружение для следующих шагов (с защитой, если CM_ENV вдруг пуст)
+          CM_ENV="${CM_ENV:-$HOME/.cm_env}"
+          touch "$CM_ENV"
           echo "export PROFILE_UUID="$PROFILE_UUID"" >> "$CM_ENV"
           echo "export PROFILE_NAME="${PROFILE_NAME:-$PROFILE_NAME_DETECTED}"" >> "$CM_ENV"
 
@@ -134,18 +136,31 @@ workflows:
           CM_EXPORT_DIR="${CM_EXPORT_DIR:-$CM_BUILD_DIR/Export}"
           mkdir -p "$CM_EXPORT_DIR"
 
-          # Проверим, что импорт профиля сохранил переменные
+          # ---------- Fallback: восстановить профиль, даже если PROFILE_UUID не доехал ----------
           PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
           if [[ -z "${PROFILE_UUID:-}" ]]; then
-            echo "❌ PROFILE_UUID не найден. Проверь шаг 'Импорт сертификата и профиля'."
-            exit 1
+            echo "⚠️  PROFILE_UUID не найден в окружении. Пытаюсь определить по файлам в '$PROFILE_DIR'."
+            if compgen -G "$PROFILE_DIR/*.mobileprovision" > /dev/null; then
+              PROFILE_FILE="$(ls -t "$PROFILE_DIR"/*.mobileprovision | head -n1)"
+              echo "Найден профиль: $PROFILE_FILE"
+              PROF_PLIST="$(mktemp -t prof.plist)"
+              security cms -D -i "$PROFILE_FILE" > "$PROF_PLIST"
+              PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" "$PROF_PLIST")
+              PROFILE_NAME_DETECTED=$(/usr/libexec/PlistBuddy -c "Print Name" "$PROF_PLIST")
+            else
+              echo "❌ В '$PROFILE_DIR' нет ни одного .mobileprovision. Проверь шаг импорта."
+              exit 1
+            fi
+          else
+            PROF_PLIST="$(mktemp -t prof.plist)"
+            security cms -D -i "$PROFILE_DIR/$PROFILE_UUID.mobileprovision" > "$PROF_PLIST"
+            PROFILE_NAME_DETECTED=$(/usr/libexec/PlistBuddy -c "Print Name" "$PROF_PLIST")
           fi
 
-          PROF_PLIST="$(mktemp -t prof.plist)"
-          security cms -D -i "$PROFILE_DIR/$PROFILE_UUID.mobileprovision" > "$PROF_PLIST"
-          PROFILE_NAME_DETECTED=$(/usr/libexec/PlistBuddy -c "Print Name" "$PROF_PLIST")
           GET_TASK_ALLOW=$(/usr/libexec/PlistBuddy -c "Print Entitlements:get-task-allow" "$PROF_PLIST" 2>/dev/null || echo "nil")
-          echo "Using profile: ${PROFILE_NAME:-$PROFILE_NAME_DETECTED} | get-task-allow=$GET_TASK_ALLOW"
+          APP_IDENTIFIER=$(/usr/libexec/PlistBuddy -c "Print Entitlements:application-identifier" "$PROF_PLIST" 2>/dev/null || echo "")
+          echo "Using profile: ${PROFILE_NAME:-$PROFILE_NAME_DETECTED}"
+          echo "application-identifier=$APP_IDENTIFIER | get-task-allow=$GET_TASK_ALLOW"
 
           if [[ "$GET_TASK_ALLOW" != "false" ]]; then
             echo "❌ Нужен App Store (Distribution) профиль. Сейчас не он."
@@ -162,7 +177,7 @@ workflows:
             /usr/libexec/PlistBuddy -c "Print ApplicationProperties:CFBundleIdentifier" "$ARCHIVE_PATH/Info.plist" || true
           fi
 
-          # 2) Автоподпись сначала
+          # 2) Автоподпись
           cat > export_auto.json <<JSON
           {
             "method": "${EXPORT_METHOD}",
@@ -184,7 +199,7 @@ workflows:
           if [[ "$XCB_RET" -ne 0 || -z "$IPA_PATH" ]]; then
             echo "Auto export failed or no IPA. Trying MANUAL for app bundle only…"
 
-            # 3) Ручная подпись только для основного bundle id
+            # 3) Ручная подпись только основного bundle id
             cat > export_manual.json <<JSON
             {
               "method": "${EXPORT_METHOD}",
