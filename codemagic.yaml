@@ -111,7 +111,7 @@ workflows:
 
       - name: "Archive and export IPA (xcodebuild)"
         script: |
-          ARCHIVE_PATH="$CM_BUILD_DIR/Trackify.xcarchive"
+          ARCHIVE_PATH="$CM_BUILD_DIR/EzenCook.xcarchive"
           EXPORT_PATH="$CM_EXPORT_DIR"
 
           # Доп. флаги версий прямо в xcodebuild (работает без Info.plist)
