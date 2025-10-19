@@ -1,4 +1,4 @@
-Yaml   workflows:
+  workflows:
   ios_appstore_manual_signing:
     name: iOS App Store Manual signing
     max_build_duration: 60
