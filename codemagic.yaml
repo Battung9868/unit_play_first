@@ -13,8 +13,8 @@ workflows:
         BUNDLE_ID: "io.battung.EzenCook"
         TEAM_ID: "OVERRIDE_BY_PROFILE"        # заменится значением из профиля
         EXPORT_METHOD: "app-store"
-        # APP_VERSION: "1.1"                  # ← опционально, если хочешь поднять маркетинговую версию
-        # APP_BUILD: "123"                    # ← опционально, если хочешь задать build вручную (иначе timestamp)
+        # APP_VERSION: "1.1"                  # ← опционально: маркетинговая версия
+        # APP_BUILD: "123"                    # ← опционально: build; иначе timestamp
 
     scripts:
       - name: Import certificate and provisioning profile
@@ -36,7 +36,7 @@ workflows:
 
           # Keychain + certificate
           keychain initialize
-          if [ -n "$CERT_PWD" ]; then
+          if [ -n "${CERT_PWD:-}" ]; then
             keychain add-certificates --certificate cert.p12 --certificate-password "$CERT_PWD"
           else
             keychain add-certificates --certificate cert.p12
@@ -52,22 +52,21 @@ workflows:
           echo "Using Provisioning Profile UUID: $PROFILE_UUID"
           echo "TeamIdentifier from profile: $PROFILE_TEAM_ID"
 
-          # export to env for next steps
-          echo "PROFILE_UUID=$PROFILE_UUID" >> "$CM_ENV"
-          echo "TEAM_ID=$PROFILE_TEAM_ID"   >> "$CM_ENV"
+          # export для следующих шагов
+          {
+            echo "PROFILE_UUID=$PROFILE_UUID"
+            echo "TEAM_ID=$PROFILE_TEAM_ID"
+          } >> "$CM_ENV"
 
-          # Resolve correct signing identity (Apple Distribution или iPhone Distribution)
+          # Resolve correct signing identity (Apple Distribution / iPhone Distribution)
           DIST_IDENTITY=$(security find-identity -v -p codesigning | sed -nE 's/.*"((Apple|iPhone) Distribution:.*)"/\1/p' | head -n1 || true)
           if [ -z "$DIST_IDENTITY" ]; then
             echo "❌ Distribution identity not found in keychain"
             security find-identity -v -p codesigning || true
             exit 1
           fi
-          echo "DIST_IDENTITY=$DIST_IDENTITY" >> "$CM_ENV"
           echo "Using signing identity: $DIST_IDENTITY"
-
-          # Diagnostics
-          echo "== Code signing identities in keychain =="; security find-identity -v -p codesigning || true
+          echo "DIST_IDENTITY=$DIST_IDENTITY" >> "$CM_ENV"
 
           # exportOptions.plist (manual)
           cat > exportOptions.plist <<EOI
@@ -89,8 +88,28 @@ workflows:
           EOI
           /usr/bin/plutil -lint exportOptions.plist
 
-          # Apply profile into the project (manual signing)
+          # Применяем профиль в проект (manual signing)
           xcode-project use-profiles --project "$XCODE_PROJECT" --export-options-plist exportOptions.plist
+
+      - name: "Sanitize entitlements (disable Push/iCloud)"
+        script: |
+          set -euo pipefail
+
+          # Ищем все *.entitlements в репозитории и чистим ключи Push/iCloud
+          mapfile -t ENT_FILES < <(find . -type f -name "*.entitlements")
+          if [ ${#ENT_FILES[@]} -eq 0 ]; then
+            echo "No *.entitlements found — nothing to sanitize."
+            exit 0
+          fi
+
+          for ENT_FILE in "${ENT_FILES[@]}"; do
+            echo "Sanitizing: $ENT_FILE"
+            /usr/libexec/PlistBuddy -c "Delete aps-environment" "$ENT_FILE" || true
+            /usr/libexec/PlistBuddy -c "Delete com.apple.developer.icloud-services" "$ENT_FILE" || true
+            /usr/libexec/PlistBuddy -c "Delete com.apple.developer.icloud-container-identifiers" "$ENT_FILE" || true
+            echo "Result:"
+            /usr/libexec/PlistBuddy -c "Print" "$ENT_FILE" || true
+          done
 
       - name: "Prepare versions (no Info.plist)"
         script: |
@@ -100,7 +119,7 @@ workflows:
           BUILD_NUM="${APP_BUILD:-$(date +%y%j%H%M%S)}"
           echo "BUILD_NUM=$BUILD_NUM" >> "$CM_ENV"
 
-          # APP_VERSION берётся из UI (если нужна смена маркетинговой версии)
+          # APP_VERSION берём из UI (если нужна смена маркетинговой версии)
           if [ -n "${APP_VERSION:-}" ]; then
             echo "APP_VERSION=$APP_VERSION" >> "$CM_ENV"
           fi
@@ -111,10 +130,12 @@ workflows:
 
       - name: "Archive and export IPA (xcodebuild)"
         script: |
-          ARCHIVE_PATH="$CM_BUILD_DIR/EzenCook.xcarchive"
+          set -euo pipefail
+
+          ARCHIVE_PATH="$CM_BUILD_DIR/EzenCook.xcarchive"  # ← было Trackify, исправлено
           EXPORT_PATH="$CM_EXPORT_DIR"
 
-          # Доп. флаги версий прямо в xcodebuild (работает без Info.plist)
+          # Доп. флаги версий прямо в xcodebuild (работает без правки Info.plist)
           EXTRA_FLAGS=( CURRENT_PROJECT_VERSION="$BUILD_NUM" )
           if [ -n "${APP_VERSION:-}" ]; then
             EXTRA_FLAGS+=( MARKETING_VERSION="$APP_VERSION" )
@@ -130,7 +151,7 @@ workflows:
             DEVELOPMENT_TEAM="$TEAM_ID" \
             CODE_SIGN_STYLE=Manual \
             PROVISIONING_PROFILE_SPECIFIER="$PROFILE_UUID" \
-            CODE_SIGN_IDENTITY="Apple Distribution" \
+            CODE_SIGN_IDENTITY="$DIST_IDENTITY" \
             COMPILER_INDEX_STORE_ENABLE=NO \
             "${EXTRA_FLAGS[@]}"
 
@@ -142,6 +163,8 @@ workflows:
 
           echo "Export dir listing:"
           ls -lah "$EXPORT_PATH" || true
+
+          # Фейлим билд, если ipa не создана
           test -e "$EXPORT_PATH"/*.ipa
 
     artifacts:
