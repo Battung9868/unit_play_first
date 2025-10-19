@@ -1,40 +1,24 @@
-# === Xcode & build artifacts ===
-*.xcuserdatad/
-xcuserdata/
-*.mode1v3
-*.mode2v3
-*.perspectivev3
-DerivedData/
+# Xcode
 build/
+DerivedData/
+*.xcuserdatad
+*.xcscmblueprint
+*.xccheckout
+
+# iOS artifacts
 *.ipa
+*.dSYM*
 *.xcarchive
-*.dSYM
-*.dSYM.zip
 
-# Если workspace генерится CocoaPods — не коммитим
-*.xcworkspace
-
-# === CocoaPods ===
+# CocoaPods (если появятся)
 Pods/
-!Podfile
-!Podfile.lock
+Podfile.lock
 
-# === SwiftPM / Carthage (если не используешь) ===
-.build/
-Carthage/Build/
+# Signing (секреты не коммитим)
+*.p12
+*.mobileprovision
+*.p8
 
-# === macOS ===
+# Misc
 .DS_Store
-
-# === Editors (опционально) ===
 .idea/
-.vscode/
-
-# === Temp files ===
-*.tmp
-*.swp
-!Il2CppOutputProject/
-!Il2CppOutputProject/IL2CPP/
-!Il2CppOutputProject/IL2CPP/build/
-!Il2CppOutputProject/IL2CPP/build/**
-
