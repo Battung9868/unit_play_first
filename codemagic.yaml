@@ -13,36 +13,26 @@ workflows:
         BUNDLE_ID: "io.battung.EzenCook"
         TEAM_ID: "OVERRIDE_BY_PROFILE"        # заменится значением из профиля
         EXPORT_METHOD: "app-store"
-        # APP_VERSION: "1.1"                  # ← опционально: маркетинговая версия
-        # APP_BUILD: "123"                    # ← опционально: build; иначе timestamp
+        # APP_VERSION: "1.1"                  # ← опционально, если хочешь поднять маркетинговую версию
+        # APP_BUILD: "123"                    # ← опционально, если хочешь задать build вручную (иначе timestamp)
 
     scripts:
-      - name: Import certificate and provisioning profile
+      - name: "Import certificate and profile"
         script: |
           set -euo pipefail
 
-          # --- Подхватываем секреты с разными именами (оба варианта поддержаны) ---
-          CERT_P12_B64="${CERTIFICATE_P12:-${CERT_P12:-}}"
-          CERT_PWD="${CERTIFICATE_PASSWORD:-${CERT_PASSWORD:-}}"
-          PROFILE_B64="${MOBILEPROVISION:-${PROFILE_MOBILEPROVISION:-}}"
-
-          # Проверки с понятными сообщениями
-          [ -n "$CERT_P12_B64" ] || { echo "❌ Missing CERTIFICATE_P12 (или CERT_P12) в группе 'signing' — это base64 вашего .p12"; exit 1; }
-          [ -n "$PROFILE_B64" ]  || { echo "❌ Missing MOBILEPROVISION (или PROFILE_MOBILEPROVISION) — это base64 вашего .mobileprovision (App Store)"; exit 1; }
-
-          # Files from secrets
-          echo "$CERT_P12_B64" | base64 --decode > cert.p12
-          echo "$PROFILE_B64"  | base64 --decode > profile.mobileprovision
+          echo "$CERTIFICATE_P12" | base64 --decode > cert.p12
+          echo "$MOBILEPROVISION" | base64 --decode > profile.mobileprovision
 
           # Keychain + certificate
           keychain initialize
-          if [ -n "${CERT_PWD:-}" ]; then
-            keychain add-certificates --certificate cert.p12 --certificate-password "$CERT_PWD"
+          if [ -n "${CERTIFICATE_PASSWORD:-}" ]; then
+            keychain add-certificates --certificate cert.p12 --certificate-password "$CERTIFICATE_PASSWORD"
           else
             keychain add-certificates --certificate cert.p12
           fi
 
-          # Install profile and extract UUID + TeamIdentifier
+          # Install provisioning profile and read UUID + TeamIdentifier
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
           PROFILE_PLIST="$(security cms -D -i profile.mobileprovision)"
           PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print UUID' /dev/stdin <<< "$PROFILE_PLIST")
@@ -52,64 +42,30 @@ workflows:
           echo "Using Provisioning Profile UUID: $PROFILE_UUID"
           echo "TeamIdentifier from profile: $PROFILE_TEAM_ID"
 
-          # export для следующих шагов
-          {
-            echo "PROFILE_UUID=$PROFILE_UUID"
-            echo "TEAM_ID=$PROFILE_TEAM_ID"
-          } >> "$CM_ENV"
+          # export to env for next steps
+          echo "PROFILE_UUID=$PROFILE_UUID" >> "$CM_ENV"
+          echo "TEAM_ID=$PROFILE_TEAM_ID"   >> "$CM_ENV"
 
-          # Resolve correct signing identity (Apple Distribution / iPhone Distribution)
-          DIST_IDENTITY=$(security find-identity -v -p codesigning | sed -nE 's/.*"((Apple|iPhone) Distribution:.*)"/\1/p' | head -n1 || true)
-          if [ -z "$DIST_IDENTITY" ]; then
-            echo "❌ Distribution identity not found in keychain"
-            security find-identity -v -p codesigning || true
-            exit 1
-          fi
-          echo "Using signing identity: $DIST_IDENTITY"
-          echo "DIST_IDENTITY=$DIST_IDENTITY" >> "$CM_ENV"
-
-          # exportOptions.plist (manual)
+          # Valid exportOptions.plist (XML)
           cat > exportOptions.plist <<EOI
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
+          <plist version="1.0"><dict>
             <key>method</key><string>${EXPORT_METHOD}</string>
             <key>teamID</key><string>${TEAM_ID}</string>
             <key>signingStyle</key><string>manual</string>
-            <key>provisioningProfiles</key>
-            <dict>
+            <key>provisioningProfiles</key><dict>
               <key>${BUNDLE_ID}</key><string>${PROFILE_UUID}</string>
             </dict>
+            <key>compileBitcode</key><false/>
             <key>stripSwiftSymbols</key><true/>
             <key>destination</key><string>export</string>
-          </dict>
-          </plist>
+          </dict></plist>
           EOI
           /usr/bin/plutil -lint exportOptions.plist
 
-          # Применяем профиль в проект (manual signing)
+          # Apply profile into the project for manual signing
           xcode-project use-profiles --project "$XCODE_PROJECT" --export-options-plist exportOptions.plist
-
-      - name: "Sanitize entitlements (disable Push/iCloud)"
-        script: |
-          set -euo pipefail
-
-          # Ищем все *.entitlements в репозитории и чистим ключи Push/iCloud
-          mapfile -t ENT_FILES < <(find . -type f -name "*.entitlements")
-          if [ ${#ENT_FILES[@]} -eq 0 ]; then
-            echo "No *.entitlements found — nothing to sanitize."
-            exit 0
-          fi
-
-          for ENT_FILE in "${ENT_FILES[@]}"; do
-            echo "Sanitizing: $ENT_FILE"
-            /usr/libexec/PlistBuddy -c "Delete aps-environment" "$ENT_FILE" || true
-            /usr/libexec/PlistBuddy -c "Delete com.apple.developer.icloud-services" "$ENT_FILE" || true
-            /usr/libexec/PlistBuddy -c "Delete com.apple.developer.icloud-container-identifiers" "$ENT_FILE" || true
-            echo "Result:"
-            /usr/libexec/PlistBuddy -c "Print" "$ENT_FILE" || true
-          done
 
       - name: "Prepare versions (no Info.plist)"
         script: |
@@ -119,7 +75,7 @@ workflows:
           BUILD_NUM="${APP_BUILD:-$(date +%y%j%H%M%S)}"
           echo "BUILD_NUM=$BUILD_NUM" >> "$CM_ENV"
 
-          # APP_VERSION берём из UI (если нужна смена маркетинговой версии)
+          # APP_VERSION берётся из UI (если нужна смена маркетинговой версии)
           if [ -n "${APP_VERSION:-}" ]; then
             echo "APP_VERSION=$APP_VERSION" >> "$CM_ENV"
           fi
@@ -129,13 +85,10 @@ workflows:
           echo "CURRENT_PROJECT_VERSION=$BUILD_NUM"
 
       - name: "Archive and export IPA (xcodebuild)"
-        script: |
-          set -euo pipefail
-
-          ARCHIVE_PATH="$CM_BUILD_DIR/EzenCook.xcarchive"  # ← было Trackify, исправлено
+        script: |ARCHIVE_PATH="$CM_BUILD_DIR/EzenCook.xcarchive"
           EXPORT_PATH="$CM_EXPORT_DIR"
 
-          # Доп. флаги версий прямо в xcodebuild (работает без правки Info.plist)
+          # Доп. флаги версий прямо в xcodebuild (работает без Info.plist)
           EXTRA_FLAGS=( CURRENT_PROJECT_VERSION="$BUILD_NUM" )
           if [ -n "${APP_VERSION:-}" ]; then
             EXTRA_FLAGS+=( MARKETING_VERSION="$APP_VERSION" )
@@ -151,7 +104,7 @@ workflows:
             DEVELOPMENT_TEAM="$TEAM_ID" \
             CODE_SIGN_STYLE=Manual \
             PROVISIONING_PROFILE_SPECIFIER="$PROFILE_UUID" \
-            CODE_SIGN_IDENTITY="$DIST_IDENTITY" \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
             COMPILER_INDEX_STORE_ENABLE=NO \
             "${EXTRA_FLAGS[@]}"
 
@@ -163,8 +116,6 @@ workflows:
 
           echo "Export dir listing:"
           ls -lah "$EXPORT_PATH" || true
-
-          # Фейлим билд, если ipa не создана
           test -e "$EXPORT_PATH"/*.ipa
 
     artifacts:
