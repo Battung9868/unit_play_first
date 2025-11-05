@@ -8,9 +8,9 @@ workflows:
         - signing            # CERTIFICATE_P12, CERTIFICATE_PASSWORD, MOBILEPROVISION
         - appstore_connect   # APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY
       vars:
-        XCODE_PROJECT: "EzenCook.xcodeproj"   # или задай XCODE_WORKSPACE вместо XCODE_PROJECT
-        XCODE_SCHEME: "EzenCook"
-        BUNDLE_ID: "io.battung.EzenCook"
+        XCODE_PROJECT: "Tires.xcodeproj"   # или задай XCODE_WORKSPACE вместо XCODE_PROJECT
+        XCODE_SCHEME: "Tires"
+        BUNDLE_ID: "com.battrex.tirecloud"
         TEAM_ID: "OVERRIDE_BY_PROFILE"        # заменится значением из профиля
         EXPORT_METHOD: "app-store"
         # APP_VERSION: "1.1"                  # ← опционально, если хочешь поднять маркетинговую версию
@@ -111,7 +111,7 @@ workflows:
 
       - name: "Archive and export IPA (xcodebuild)"
         script: |
-          ARCHIVE_PATH="$CM_BUILD_DIR/EzenCook.xcarchive"
+          ARCHIVE_PATH="$CM_BUILD_DIR/Tires.xcarchive"
           EXPORT_PATH="$CM_EXPORT_DIR"
 
           # Доп. флаги версий прямо в xcodebuild (работает без Info.plist)
